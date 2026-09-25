@@ -217,7 +217,7 @@ class Geocoder:
     ) -> None:
         asks: list[TownAsk] = []
         ask_items: list[_Item] = []
-        ask_candidates: list[list[TownCandidate]] = []
+        ask_groups: list[list[list[TownCandidate]]] = []
 
         for item in items:
             candidates = [c for c in item.candidates.candidates if c.town_id in records]
@@ -240,42 +240,54 @@ class Geocoder:
                     )
                     outcome.town_fast_path += 1
                     continue
+            # **表示が同じ候補を Jev に重ねて見せない。** 京都市中京区には
+            # 同名の「大文字町」が 4 つあり、そのまま並べると同一文字列の
+            # 選択肢が 4 つ並ぶ。答えようがないので確信度が割れ、住所としては
+            # 正しいのに閾値を下回って粒度が落ちていた。
+            groups = _group_by_display(candidates, records)
             asks.append(
                 TownAsk(
                     query=item.query,
                     normalized=item.normalized,
-                    options=[records[c.town_id].display for c in candidates],
+                    options=[records[g[0].town_id].display for g in groups],
                 )
             )
             ask_items.append(item)
-            ask_candidates.append(candidates)
+            ask_groups.append(groups)
 
         if asks and self._reranker is not None:
             result = await self._reranker.pick_towns(asks)
             _merge_usage(outcome.usage, result.usage)
             for index, item in enumerate(ask_items):
-                candidates = ask_candidates[index]
+                groups = ask_groups[index]
                 decision = result.decisions[index] if index < len(result.decisions) else None
                 if decision is None:
                     # Jev が答えを返さなかった。語彙スコア最上位で代替する。
-                    item.town = records[candidates[0].town_id]
-                    item.tail = parse_tail(candidates[0].remainder)
+                    item.town = records[groups[0][0].town_id]
+                    item.tail = parse_tail(groups[0][0].remainder)
                     item.result.note = _failure_note(result.failure)
                     item.town_decision = Decision(
                         index=0, probability=0.0, confidence=0.0, contains_answer=0.0
                     )
                     continue
                 item.town_decision = decision
-                if decision.index is not None and 0 <= decision.index < len(candidates):
-                    chosen = candidates[decision.index]
+                if decision.index is not None and 0 <= decision.index < len(groups):
+                    group = groups[decision.index]
+                    chosen = group[0]
                     item.town = records[chosen.town_id]
                     item.tail = parse_tail(chosen.remainder)
+                    if len(group) > 1:
+                        # 住所の表記は決まったが、どの machiaza_id かは
+                        # 入力からは決められない。代表の座標を返す。
+                        item.result.note = item.result.note or (
+                            f"同名の町字が {len(group)} 件あり、座標は代表のもの"
+                        )
         elif asks:
             # モデルが無い（索引だけで動かしている）場合も語彙スコア最上位。
             for index, item in enumerate(ask_items):
-                candidates = ask_candidates[index]
-                item.town = records[candidates[0].town_id]
-                item.tail = parse_tail(candidates[0].remainder)
+                first = ask_groups[index][0][0]
+                item.town = records[first.town_id]
+                item.tail = parse_tail(first.remainder)
                 item.town_decision = Decision(
                     index=0, probability=0.0, confidence=0.0, contains_answer=0.0
                 )
@@ -487,6 +499,19 @@ class Geocoder:
 
 
 # ------------------------------------------------------------------ 補助
+
+
+def _group_by_display(
+    candidates: Sequence[TownCandidate], records: dict[int, TownRecord]
+) -> list[list[TownCandidate]]:
+    """候補を表示住所ごとにまとめる。出現順を保つ。
+
+    同じ文字列の選択肢を Jev に複数見せても選びようがないので、1 つにまとめる。
+    """
+    groups: dict[str, list[TownCandidate]] = {}
+    for candidate in candidates:
+        groups.setdefault(records[candidate.town_id].display, []).append(candidate)
+    return list(groups.values())
 
 
 def _group_by_oaza(

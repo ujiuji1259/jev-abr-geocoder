@@ -179,7 +179,7 @@ class Reranker:
             for chunk_no, start in enumerate(range(0, len(ask.options), size)):
                 jobs.append((index, chunk_no, ask.options[start : start + size]))
 
-        groups = _pack(jobs, self._cfg.beam_token_budget)
+        groups = _pack(jobs, self._cfg.beam_token_budget, self._cfg.beam_max_asks_per_request)
         results = await asyncio.gather(*(self._narrow_group(asks, group) for group in groups))
 
         survivors: list[list[int]] = [[] for _ in asks]
@@ -276,19 +276,28 @@ def _estimate_tokens(options: Sequence[str]) -> int:
 
 
 def _pack(
-    jobs: Sequence[tuple[int, int, Sequence[str]]], budget: int
+    jobs: Sequence[tuple[int, int, Sequence[str]]], budget: int, max_asks: int
 ) -> list[list[tuple[int, int, Sequence[str]]]]:
-    """見積もりトークン量が ``budget`` に収まるように分割をまとめる。"""
+    """分割をリクエストにまとめる。
+
+    トークン量が ``budget`` に収まり、1 リクエストに載る入力が ``max_asks``
+    を超えないようにする。後者はトークンではなく精度のための制約で、
+    複数の入力を詰めると絞り込みが鈍ることが実測で出ている。
+    """
     groups: list[list[tuple[int, int, Sequence[str]]]] = []
     current: list[tuple[int, int, Sequence[str]]] = []
     used = _REQUEST_OVERHEAD
+    asks: set[int] = set()
     for job in jobs:
         cost = _estimate_tokens(job[2])
-        if current and used + cost > budget:
+        too_many_asks = job[0] not in asks and len(asks) >= max(1, max_asks)
+        if current and (used + cost > budget or too_many_asks):
             groups.append(current)
             current = []
             used = _REQUEST_OVERHEAD
+            asks = set()
         current.append(job)
+        asks.add(job[0])
         used += cost
     if current:
         groups.append(current)
