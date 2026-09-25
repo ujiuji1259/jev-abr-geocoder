@@ -19,7 +19,7 @@ from . import textnorm
 from .config import GeocoderConfig
 from .index.townindex import TownIndex
 from .match.candidates import CandidateFinder, CandidateSet
-from .match.rerank import DecisionModel, JevModel, NumberAsk, Reranker, TownAsk
+from .match.rerank import BeamAsk, DecisionModel, JevModel, NumberAsk, Reranker, TownAsk
 from .match.tail import Tail, parse_tail
 from .models import (
     BatchOutcome,
@@ -122,6 +122,7 @@ class Geocoder:
         items = [self._prepare(query) for query in queries]
         town_records = self._load_town_records(items)
 
+        await self._narrow(items, town_records, outcome)
         await self._resolve_towns(items, town_records, outcome)
         self._load_numbers(items)
         await self._resolve_numbers(items, outcome)
@@ -145,6 +146,68 @@ class Geocoder:
         """バッチ全体の候補について町字レコードをまとめて引く。"""
         town_ids = {candidate.town_id for item in items for candidate in item.candidates.candidates}
         return self._index.store.towns(sorted(town_ids))
+
+    async def _narrow(
+        self,
+        items: Sequence[_Item],
+        records: dict[int, TownRecord],
+        outcome: BatchOutcome,
+    ) -> None:
+        """候補が Choice の上限を超えた入力だけ、先に大字を決めて絞る。
+
+        町字は「大字 + 丁目 + 小字」なので、**大字だけを選ばせると選択肢が
+        一桁以上減る**（福井市 15,399 町字 -> 629 大字、福島市 8,132 -> 205）。
+        上限を超える市区町村は町字で数えると 26.0% だが、大字で数えると 4.4%
+        まで落ちる。大字名は平均 4.2 文字で、町字フルネームの 16.6 文字に対し
+        トークンも 1/4 で済む。
+
+        **この段があるぶん、その入力だけは往復が 3 回になる。** 走るのは
+        全体の 0.3% 程度なので、バッチ全体では 1 リクエスト増えるだけ。
+        """
+        asks: list[BeamAsk] = []
+        ask_items: list[_Item] = []
+        ask_groups: list[list[list[TownCandidate]]] = []
+
+        for item in items:
+            if not item.candidates.needs_beam:
+                continue
+            candidates = [c for c in item.candidates.candidates if c.town_id in records]
+            if not candidates or self._reranker is None:
+                # 判定モデルが無いなら絞りようがない。粒度を落とす。
+                item.candidates = _without_candidates(item.candidates)
+                continue
+            groups = _group_by_oaza(candidates, records)
+            asks.append(
+                BeamAsk(
+                    query=item.query,
+                    normalized=item.normalized,
+                    options=[records[g[0].town_id].oaza_display for g in groups],
+                )
+            )
+            ask_items.append(item)
+            ask_groups.append(groups)
+
+        if not asks or self._reranker is None:
+            return
+        result = await self._reranker.narrow(asks)
+        _merge_usage(outcome.usage, result.usage)
+        outcome.beam_requests += result.usage.requests
+        for index, item in enumerate(ask_items):
+            groups = ask_groups[index]
+            kept = result.survivors[index] if index < len(result.survivors) else []
+            survivors: list[TownCandidate] = []
+            for group_index in kept:
+                if 0 <= group_index < len(groups):
+                    survivors.extend(groups[group_index])
+            if not survivors:
+                item.result.note = item.result.note or (
+                    _failure_note(result.failure) if result.failure else "候補を絞り込めなかった"
+                )
+            # 大字が決まっても丁目・小字が上限を超えることがある（全国 129,584
+            # 組のうち 80 組）。次段が API 制限を破らないようここで収める。
+            item.candidates = _with_candidates(
+                item.candidates, survivors[: self._cfg.max_candidates]
+            )
 
     async def _resolve_towns(
         self,
@@ -424,6 +487,31 @@ class Geocoder:
 
 
 # ------------------------------------------------------------------ 補助
+
+
+def _group_by_oaza(
+    candidates: Sequence[TownCandidate], records: dict[int, TownRecord]
+) -> list[list[TownCandidate]]:
+    """候補を大字ごとにまとめる。出現順を保つ。"""
+    groups: dict[str, list[TownCandidate]] = {}
+    for candidate in candidates:
+        groups.setdefault(records[candidate.town_id].oaza_display, []).append(candidate)
+    return list(groups.values())
+
+
+def _with_candidates(base: CandidateSet, candidates: list[TownCandidate]) -> CandidateSet:
+    return CandidateSet(
+        candidates=candidates,
+        exact=base.exact,
+        city_id=base.city_id,
+        pref_lg_code=base.pref_lg_code,
+        exhausted=base.exhausted,
+        needs_beam=False,
+    )
+
+
+def _without_candidates(base: CandidateSet) -> CandidateSet:
+    return _with_candidates(base, [])
 
 
 def _merge_usage(target: Usage, source: Usage) -> None:

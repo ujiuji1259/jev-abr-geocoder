@@ -205,3 +205,28 @@ def test_max_candidates_leaves_room_for_the_none_option() -> None:
 
     cfg = GeocoderConfig()
     assert cfg.max_candidates == cfg.max_options - 1
+
+
+async def test_beam_narrows_a_big_city_in_one_extra_round(data_dir: Path, model: FakeModel) -> None:
+    """候補が Choice の上限を超えたら、分割して 1 往復で絞る。
+
+    分割数がいくつでも beam の往復は 1 回。福井市の 15,399 件 (61 分割) でも
+    1 リクエストに収まる。
+    """
+    cfg = GeocoderConfig(max_options=3, beam=True)  # 候補 2 件ごとに分割
+    with Geocoder.open(data_dir, model=model, cfg=cfg) as geocoder:
+        outcome = await geocoder.run(["鳥取県鳥取市面かげ1丁目1-2"])
+    assert outcome.beam_requests == 1
+    # beam 1 回 + 町字 1 回。番号は町字が決まってから。
+    assert model.request_count <= 3
+    for _state, questions in model.calls:
+        for question in questions.values():
+            assert len(question.criteria) <= cfg.max_options
+
+
+async def test_beam_disabled_falls_back_to_city(data_dir: Path, model: FakeModel) -> None:
+    cfg = GeocoderConfig(max_options=3, beam=False)
+    with Geocoder.open(data_dir, model=model, cfg=cfg) as geocoder:
+        result = await geocoder.geocode("鳥取県鳥取市面かげ1丁目1-2")
+    assert result.level <= Level.CITY
+    assert model.request_count == 0

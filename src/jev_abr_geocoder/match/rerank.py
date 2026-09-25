@@ -10,12 +10,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ..config import (
+    BEAM_QUESTION,
     NONE_OPTION,
     NONE_OPTION_DESCRIPTION,
     NUMBER_QUESTION,
@@ -24,7 +26,16 @@ from ..config import (
 )
 from ..models import Decision, NumberKind, Usage
 
-__all__ = ["DecisionModel", "JevModel", "Reranker", "TownAsk", "NumberAsk", "RerankOutcome"]
+__all__ = [
+    "DecisionModel",
+    "JevModel",
+    "Reranker",
+    "TownAsk",
+    "NumberAsk",
+    "BeamAsk",
+    "BeamOutcome",
+    "RerankOutcome",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -65,6 +76,25 @@ class NumberAsk:
     kind: NumberKind
     #: 選択肢の番号表記。索引の順と 1 対 1 で対応する。
     options: Sequence[str]
+
+
+@dataclass(frozen=True, slots=True)
+class BeamAsk:
+    """候補が Choice の上限を超えたときの分割絞り込みの依頼。"""
+
+    query: str
+    normalized: str
+    #: 市区町村配下の全町字。索引の順と 1 対 1 で対応する。
+    options: Sequence[str]
+
+
+@dataclass(slots=True)
+class BeamOutcome:
+    """各依頼について、勝ち残ったオプションの添字。"""
+
+    survivors: list[list[int]]
+    usage: Usage
+    failure: str = ""
 
 
 @dataclass(slots=True)
@@ -125,6 +155,77 @@ class Reranker:
             )
         return await self._run(state, questions, len(asks))
 
+    async def narrow(self, asks: Sequence[BeamAsk]) -> BeamOutcome:
+        """候補を Choice の上限以下に絞る。
+
+        一覧を上限ごとに分割し、各分割について「この一覧の中にあるか」を訊く。
+        Jev は 1 リクエスト内の全質問を並列に評価するので、分割を詰め込めるだけ
+        往復は減る。
+
+        ただし **Jev の上限は 64k tokens/リクエスト**で、実測では 254 件の
+        選択肢 1 分割が 9,727 トークン。超えると max_tokens_exceeded で
+        リクエストごと失敗するので、トークン量を見積もって
+        ``beam_token_budget`` に収まるように詰め、**並行に**投げる。
+
+        絞り込みの基準はここでも設けない。どれを残すかは Jev が決める。
+        """
+        if not asks:
+            return BeamOutcome(survivors=[], usage=Usage())
+
+        size = self._cfg.max_candidates
+        # (ask の添字, 分割番号, 選択肢) を平らに並べてから詰める。
+        jobs: list[tuple[int, int, Sequence[str]]] = []
+        for index, ask in enumerate(asks):
+            for chunk_no, start in enumerate(range(0, len(ask.options), size)):
+                jobs.append((index, chunk_no, ask.options[start : start + size]))
+
+        groups = _pack(jobs, self._cfg.beam_token_budget)
+        results = await asyncio.gather(*(self._narrow_group(asks, group) for group in groups))
+
+        survivors: list[list[int]] = [[] for _ in asks]
+        usage = Usage()
+        failure = ""
+        for picked, group_usage, group_failure in results:
+            _add_usage(usage, group_usage)
+            failure = failure or group_failure
+            for ask_index, option_index in picked:
+                survivors[ask_index].append(option_index)
+        for kept in survivors:
+            kept.sort()
+        return BeamOutcome(survivors=survivors, usage=usage, failure=failure)
+
+    async def _narrow_group(
+        self, asks: Sequence[BeamAsk], group: Sequence[tuple[int, int, Sequence[str]]]
+    ) -> tuple[list[tuple[int, int]], Usage, str]:
+        size = self._cfg.max_candidates
+        state: dict[str, Any] = {}
+        questions: dict[str, Any] = {}
+        for ask_index, chunk_no, options in group:
+            key = f"q{ask_index}"
+            if key not in state:
+                ask = asks[ask_index]
+                state[key] = {"入力": ask.query, "正規化": ask.normalized}
+            questions[f"{key}_{chunk_no}"] = _choice(
+                instructions={"対象": f"`{key}`", "質問": BEAM_QUESTION},
+                options=options,
+                label="住所",
+            )
+
+        usage = Usage()
+        try:
+            answers, tokens = await self._model.ask(state, questions)
+        except Exception as exc:  # noqa: BLE001 - 外部モデルの不調で落とさない
+            _log.warning("Jev の分割絞り込みに失敗: %s", exc)
+            return [], usage, str(exc)
+        usage.add(tokens[0], tokens[1])
+
+        picked: list[tuple[int, int]] = []
+        for ask_index, chunk_no, _options in group:
+            decision = _decision(answers.get(f"q{ask_index}_{chunk_no}"))
+            if decision.index is not None:
+                picked.append((ask_index, chunk_no * size + decision.index))
+        return picked, usage, ""
+
     async def pick_numbers(self, asks: Sequence[NumberAsk]) -> RerankOutcome:
         if not asks:
             return RerankOutcome(decisions=[], usage=Usage())
@@ -159,6 +260,45 @@ class Reranker:
         return RerankOutcome(
             decisions=[_decision(answers.get(f"q{i}")) for i in range(count)], usage=usage
         )
+
+
+#: 1 選択肢あたりの固定費（JSON の鍵と区切り）と、日本語 1 文字あたりの
+#: トークン数。実測（254 件・4,211 文字で 9,727 トークン）から取った。
+_TOKENS_PER_CHAR = 2.0
+_TOKENS_PER_OPTION = 6
+#: 質問文と state の分。
+_REQUEST_OVERHEAD = 800
+
+
+def _estimate_tokens(options: Sequence[str]) -> int:
+    chars = sum(len(option) for option in options)
+    return int(chars * _TOKENS_PER_CHAR) + len(options) * _TOKENS_PER_OPTION
+
+
+def _pack(
+    jobs: Sequence[tuple[int, int, Sequence[str]]], budget: int
+) -> list[list[tuple[int, int, Sequence[str]]]]:
+    """見積もりトークン量が ``budget`` に収まるように分割をまとめる。"""
+    groups: list[list[tuple[int, int, Sequence[str]]]] = []
+    current: list[tuple[int, int, Sequence[str]]] = []
+    used = _REQUEST_OVERHEAD
+    for job in jobs:
+        cost = _estimate_tokens(job[2])
+        if current and used + cost > budget:
+            groups.append(current)
+            current = []
+            used = _REQUEST_OVERHEAD
+        current.append(job)
+        used += cost
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _add_usage(target: Usage, source: Usage) -> None:
+    target.input_tokens += source.input_tokens
+    target.output_tokens += source.output_tokens
+    target.requests += source.requests
 
 
 #: Jev の Choice が受け付けるオプション数の上限（API の制約）。

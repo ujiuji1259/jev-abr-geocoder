@@ -72,6 +72,9 @@ class CandidateSet:
     #: 入力がこの粒度で終わっており、それ以上細かく探す余地が無い場合に設定する。
     #: このとき候補は空だが、その粒度としては確信を持って解決できている。
     exhausted: Level | None = None
+    #: 候補が Choice の上限を超えており、Jev で分割絞り込み (beam) が要る。
+    #: このとき candidates は上限を超えた件数を持つので、そのままでは渡せない。
+    needs_beam: bool = False
 
     def unambiguous(self) -> TownCandidate | None:
         """選ぶ余地が無い候補があればそれを返す。
@@ -218,25 +221,25 @@ class CandidateFinder:
         まさに Jev の仕事**なので、絞り込みをせずに選択肢として並べる。
 
         ここでは順位づけも足切りもしない。市区町村が決まっていれば母集団は
-        高々その町字数で、74% の市区町村は 255 件に収まる。収まらない場合は
-        何を落とすかの判断が要ってしまうので、**手を出さずに粒度を落とす**
-        （§11 の未解決事項）。
+        高々その町字数で、74% の市区町村は 255 件に収まる。
 
-        全体の 0.3% しか通らない経路なので、上限いっぱいの選択肢を渡しても
-        コストは無視できる。
+        収まらない場合（26%、最大は福井市の 15,399 件）は ``needs_beam`` を
+        立てて全件を持ち帰る。何を落とすかの判断はやはりこちらではせず、
+        分割して Jev に「この一覧の中にあるか」を並列に訊いて絞る。
         """
         city_hits = self._index.city_prefixes(normalized)
         if not city_hits:
             return None
         best = city_hits[0]
         limit = self._cfg.max_candidates
-        # 上限を 1 件でも超えたら諦めるため、limit + 1 件まで取って判定する。
-        keys = self._index.keys_under(best.key, (limit + 1) * 8)
+        ceiling = self._cfg.beam_max_candidates if self._cfg.beam else limit
+        keys = self._index.keys_under(best.key, (ceiling + 1) * 8)
         seen: dict[int, str] = {}
         for key, town_id in keys:
             if town_id not in seen:
                 seen[town_id] = key
-            if len(seen) > limit:
+            if len(seen) > ceiling:
+                # beam でも扱いきれない規模。粒度を落とす。
                 return None
         if not seen:
             return None
@@ -251,7 +254,12 @@ class CandidateFinder:
             TownCandidate(town_id=town_id, matched=matched, remainder=remainder, score=0.0)
             for town_id in seen
         ]
-        return CandidateSet(candidates=candidates, exact=False, city_id=best.city_id)
+        return CandidateSet(
+            candidates=candidates,
+            exact=False,
+            city_id=best.city_id,
+            needs_beam=len(candidates) > limit,
+        )
 
     # ------------------------------------------- ⑤ 粒度を落とす
 

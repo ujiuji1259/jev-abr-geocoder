@@ -126,6 +126,14 @@ class TownRecord:
         return f"{self.pref}{self.county}{self.city}{self.ward}{self.town}"
 
     @property
+    def oaza_display(self) -> str:
+        """大字までの表示。丁目・小字を落とした形。
+
+        候補が多すぎる市区町村で、先に大字だけを選ばせるときに使う。
+        """
+        return f"{self.pref}{self.county}{self.city}{self.ward}{self.oaza_cho}"
+
+    @property
     def machiaza_code(self) -> str:
         """ABR 表記の 7 桁 machiaza_id。"""
         return f"{self.machiaza_id:07d}"
@@ -330,3 +338,5 @@ class BatchOutcome:
     town_fast_path: int = 0
     #: Jev を呼ばずに番号が決まった件数
     number_fast_path: int = 0
+    #: 分割絞り込み (beam) のために増えた往復数
+    beam_requests: int = 0

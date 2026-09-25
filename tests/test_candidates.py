@@ -57,11 +57,21 @@ def test_typo_hands_the_whole_city_to_jev(index: TownIndex) -> None:
     assert all(c.remainder == "1丁目1-2" for c in found.candidates)
 
 
-def test_city_wide_gives_up_when_the_city_has_too_many_towns(index: TownIndex) -> None:
-    """255 件に収まらない市区町村では、何を落とすかの判断が要るので手を出さない。"""
+def test_city_wide_marks_overflow_for_beam(index: TownIndex) -> None:
+    """255 件に収まらないときは全件を持ち帰り、分割絞り込みに回す。"""
     from jev_abr_geocoder.config import GeocoderConfig
 
-    cfg = GeocoderConfig(max_options=3)  # 候補は 2 件まで
+    cfg = GeocoderConfig(max_options=3, beam=True)  # 候補は 2 件まで
+    found = CandidateFinder(index, cfg).find(normalize("鳥取県鳥取市面かげ1丁目1-2"))
+    assert found.needs_beam
+    assert len(found.candidates) > cfg.max_candidates
+
+
+def test_city_wide_gives_up_when_beam_is_disabled(index: TownIndex) -> None:
+    """beam を切れば、従来どおり粒度を落とす。"""
+    from jev_abr_geocoder.config import GeocoderConfig
+
+    cfg = GeocoderConfig(max_options=3, beam=False)
     found = CandidateFinder(index, cfg).find(normalize("鳥取県鳥取市面かげ1丁目1-2"))
     assert found.candidates == []
     assert found.city_id is not None
