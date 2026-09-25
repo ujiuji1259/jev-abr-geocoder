@@ -44,15 +44,15 @@ src/jev_abr_geocoder/
 │
 ├── index/               永続化層（Jev を知らない）
 │   ├── keys.py          ★ エイリアス鍵生成規則の唯一の置き場
-│   ├── townindex.py     層1 読み書き: town.marisa + towns.bin
+│   ├── townindex.py     層1 読み書き: town.marisa の mmap + 市区町村索引
 │   ├── numblob.py       層2 バイナリ仕様: エンコード / デコード
-│   ├── store.py         層2 読み書き: abr.db
+│   ├── store.py         abr.db への読み書き（層1 のレコードと層2 の BLOB）
 │   └── build.py         構築オーケストレーション（再開可能）
 │
 ├── match/               候補生成と判定
 │   ├── candidates.py    層1 の候補生成（前方一致 → フォールバック）
 │   ├── tail.py          数値テール抽出
-│   └── rerank.py        Jev 呼び出し（Choice + Noul）
+│   └── rerank.py        Jev 呼び出し（Choice、該当なしは予約オプション）
 │
 ├── geocoder.py          オーケストレーション
 └── cli.py               薄いアダプタ
@@ -66,7 +66,7 @@ src/jev_abr_geocoder/
 
 トライのペイロードは町字レコードへのインデックス (`<I`) だけを持つ。表示用の住所文字列と座標は `abr.db` の `town` テーブルに置く。
 
-**理由**: 鍵は 2.27M 本あるが町字は 727k 件しかないので、トライにレコードを埋め込むと 3.1 倍冗長になる。また、トライの鍵は NFKC 正規化後のエイリアスであり、**出力に使うべき ABR の正規表記そのものではない**（「鳥取県鳥取市面影1丁目」ではなく「鳥取県鳥取市面影一丁目」を返したい）。
+**理由**: 鍵は 5.14M 本あるが町字は 727k 件しかないので、トライにレコードを埋め込むと 7.1 倍冗長になる。また、トライの鍵は NFKC 正規化後のエイリアスであり、**出力に使うべき ABR の正規表記そのものではない**（「鳥取県鳥取市面影1丁目」ではなく「鳥取県鳥取市面影一丁目」を返したい）。
 
 ### `town` テーブル
 
@@ -78,13 +78,12 @@ CREATE TABLE town(
   pref         TEXT, county TEXT, city TEXT, ward TEXT,
   oaza_cho     TEXT, chome TEXT, koaza TEXT,
   rsdt_addr_flg INTEGER NOT NULL,
-  status_flg   INTEGER NOT NULL,
   lat_1e7      INTEGER, lon_1e7 INTEGER
 );
 CREATE INDEX town_by_city ON town(lg_code, machiaza_id);
 ```
 
-約 150 MB。`town_id` は `INTEGER PRIMARY KEY`（= rowid のエイリアス）なので、トライが返す ID からの引きは B-tree の直接引きになる。
+全国で約 61 MB（`abr.db` 全体、層2 を除く）。`town_id` は `INTEGER PRIMARY KEY`（= rowid のエイリアス）なので、トライが返す ID からの引きは B-tree の直接引きになる。
 
 行を引くのは**候補を 255 件に絞ったあと**だけなので、1 クエリあたり高々数百行。行デコードのコストは Jev の往復（70〜500 ms）に対して無視できる。
 
@@ -103,14 +102,15 @@ class TownIndex:
     def prefixes(self, text: str) -> list[TownHit]:
         """text の前方一致鍵をすべて返す。長い順。"""
 
-    def under(self, prefix: str, limit: int) -> list[TownHit]:
-        """prefix 配下の町字を返す。フォールバック用。"""
+    def keys_under(self, prefix: str, limit: int) -> list[tuple[str, int]]:
+        """prefix 配下の (鍵, town_id)。曖昧一致スキャンの母集合。"""
 
-    def record(self, town_id: int) -> TownRecord: ...
+    def city_prefixes(self, text: str) -> list[CityHit]: ...
+    def pref_prefix(self, text: str) -> tuple[PrefRecord, str] | None: ...
 
     @property
-    def meta(self) -> IndexMeta:
-        """ABR の取得日時・件数・索引フォーマット版。"""
+    def store(self) -> Store:
+        """町字レコードと層2 の BLOB を引くための SQLite。"""
 ```
 
 `TownHit` は `(town_id: int, matched_len: int)` の軽量タプル。`TownRecord` への変換は必要になってから行う（候補を 255 件に絞ったあとでよい）。
@@ -125,22 +125,21 @@ class NumberKind(IntEnum):
     RSDT = 2
     PARCEL = 3
 
-class NumberStore:
+class Store:
     @classmethod
-    def open(cls, data_dir: Path, *, readonly: bool = True) -> NumberStore: ...
+    def open(cls, path: Path, *, readonly: bool = True) -> Store: ...
 
-    def fetch(
+    def fetch_numbers(
         self,
         lg_code: int,
         machiaza_id: int,
         kind: NumberKind,
         *,
-        first: int | None = None,
-        limit: int | None = None,
+        num1: int | None = None,
     ) -> list[NumberEntry]:
         """町字配下の番号を返す。
 
-        first を与えるとチャンク目録で二分探索し、その第1番号を含む
+        num1 を与えるとチャンク目録で二分探索し、その番号を含む
         チャンクだけを展開する。町字の大きさによらず 0.2 ms 程度。
         """
 ```
@@ -148,16 +147,15 @@ class NumberStore:
 ```python
 @dataclass(frozen=True, slots=True)
 class NumberEntry:
-    num1: int          # blk_num / blk_num / prc_num1
-    num2: int          # -       / rsdt_num / prc_num2
-    num3: int          # -       / -        / prc_num3
-    lat: float | None
-    lon: float | None
+    num1: int            # blk_num / blk_num  / prc_num1
+    num2: int            # -       / rsdt_num / prc_num2
+    num3: int            # -       / rsdt_num2 / prc_num3
+    point: Point | None
 ```
 
 `blk_id` / `rsdt_id` / `prc_id` は番号のゼロ詰めであることを実測で確認済みなので格納せず、出力時に `models.py` のヘルパで復元する。
 
-`numblob.py` は `encode(entries) -> bytes` と `decode(blob, first=None) -> list[NumberEntry]` の純関数2本だけを公開する。SQLite を知らないので、エンコード・デコードのラウンドトリップテストが単体で書ける。
+`numblob.py` は `encode(entries) -> bytes` と `decode(blob, num1=None) -> list[NumberEntry]` の純関数2本だけを公開する。SQLite を知らないので、エンコード・デコードのラウンドトリップテストが単体で書ける。
 
 ---
 
@@ -176,14 +174,18 @@ class TownCandidate:
 class CandidateFinder:
     def __init__(self, index: TownIndex, cfg: GeocoderConfig): ...
 
-    def find(self, normalized: str) -> list[TownCandidate]:
-        """候補を最大 cfg.max_options 件返す。"""
+    def find(self, normalized: str) -> CandidateSet:
+        """候補を最大 cfg.max_options 件返す。
+
+        CandidateSet.unambiguous() が非 None なら、最長一致が一意なので
+        Jev を呼ばずに確定できる。
+        """
 ```
 
 探索の順序:
 
 1. `index.prefixes(normalized)` — 5.3 µs。一致鍵をすべて取る
-2. 0 件なら**段階的に短くしてフォールバック**する。都道府県+市区町村の前方一致を探し、`index.under(city_prefix)` でその配下だけ取り出して編集距離スキャン
+2. 0 件なら**段階的に短くしてフォールバック**する。都道府県+市区町村の前方一致を探し、`index.keys_under(city_prefix)` でその配下だけ取り出して編集距離スキャン
 3. 市区町村すら当たらなければ、1,918 件の市区町村全体に編集距離スキャン（数ミリ秒）
 
 **`score` は順位付け専用。** 255 件に収まらないときにどれを落とすかを決めるためだけに使う。「スコアがこの値以上なら採用」という判断は書かない — それをやり始めると閾値調整が始まり、原則1 が崩れる。
@@ -211,22 +213,21 @@ N 件の入力を1リクエストに詰める。`state` に全入力を置き、
 
 ```python
 state = {
-    "inputs": {
-        "q0": {"原文": "鳥取市面かげ1-2-3 〇〇マンション301"},
-        "q1": {"原文": "..."},
-    }
+    "q0": {"入力": "鳥取市面かげ1-2-3 〇〇マンション301", "正規化": "..."},
+    "q1": {"入力": "..."},
 }
 questions = {
-    "q0":      Choice(instructions={...,"対象": "`inputs.q0`"}, criteria={...}),
-    "q0_has":  Noul(instructions={...,"対象": "`inputs.q0`"}),
-    "q1":      Choice(...),
-    "q1_has":  Noul(...),
+    "q0": Choice(
+        instructions={"対象": "`q0`", "質問": TOWN_QUESTION},
+        criteria={"c0": {...}, "c1": {...}, "__none__": "候補のいずれでもない"},
+    ),
+    "q1": Choice(...),
 }
 ```
 
 Choice の criteria は **最大 255 オプション**。候補がそれを超える場合は `score` 順に切る。
 
-`Noul`（「候補の中に正解が含まれるか」）を同じリクエストに載せるのは、ABR 未収載・入力が住所でない、を検出するため。Jev は全質問を並列評価するので追加レイテンシはほぼゼロ。
+**「候補のいずれでもない」は別の `Noul` ではなく Choice の予約オプション `__none__` として持たせる。** 同じ確率分布の中に該当なしの確率が出るので解釈が一貫し、リクエストも 1 問で済む。
 
 ### 戻り値
 
@@ -236,7 +237,8 @@ class Decision:
     index: int | None      # 選ばれた候補の添字。None = 該当なし
     probability: float     # 選択肢への確率質量
     confidence: float      # Jev の確信度
-    contains_answer: float # Noul の値
+    contains_answer: float # 1 - (__none__ の確率)
+    fast_path: bool        # Jev を呼ばずに決めた場合 True
 ```
 
 `rerank.py` は候補リストと `Decision` の対応づけまでを担い、**閾値との比較はしない**。判断は `geocoder.py` が `config.py` の閾値を見て行う。
@@ -256,8 +258,7 @@ class Geocoder:
     def __init__(
         self,
         index: TownIndex,
-        store: NumberStore,
-        model: DecisionModel,
+        model: DecisionModel | None,
         cfg: GeocoderConfig,
     ) -> None: ...
 
@@ -277,15 +278,15 @@ class Geocoder:
 ```
 1. 正規化          textnorm.normalize()                 純関数
 2. 候補生成        CandidateFinder.find()               mmap のみ、IO なし
-3. 分岐            候補1件 → ファストパス / 複数 → Jev へ
-4. Jev 往復 ①     町字確定（Choice + Noul をまとめて1リクエスト）
-5. 番号取得        NumberStore.fetch()                  確定した町字だけ、1件1ブロブ
+3. 分岐            最長一致が一意 → ファストパス / 競合・曖昧 → Jev へ
+4. Jev 往復 ①     町字確定（バッチ全体を1リクエスト）
+5. 番号取得        Store.fetch_numbers()                確定した町字だけ、1件1ブロブ
 6. 分岐            テールが一意に一致 → ファストパス / それ以外 → Jev へ
 7. Jev 往復 ②     番号確定（1リクエスト）
 8. 組み立て        confidence ゲートを見て粒度を決める
 ```
 
-**ファストパスが全件で効けば Jev 往復は 0 回。** 定型入力が多い実運用ではここが支配的になる。`cfg.always_rerank` で無効化し、Jev 経路の精度を評価できるようにする。
+**ファストパスが全件で効けば Jev 往復は 0 回。** geolonia の難例 7,191 件では 99.1% がここで決まり、Jev に回るのは 0.9% だった。`cfg.always_rerank` で無効化し、Jev 経路の精度を評価できるようにする。
 
 ### confidence ゲート
 
