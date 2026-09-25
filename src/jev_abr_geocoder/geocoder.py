@@ -339,12 +339,16 @@ class Geocoder:
                 continue
             entries = _rank_entries(item.entries, item.tail.numbers, self._cfg.max_candidates)
             exact = [e for e in entries if e.numbers == item.tail.numbers]
-            if not exact and not self._cfg.always_rerank:
+            if not exact and not self._cfg.always_rerank and not item.tail.skipped:
                 # **入力が候補の番号列の先頭になっている。** 「中砂見936番地」に
                 # 対し ABR は 936-1 / 936-2 / 936-3 しか持たない、という型。
                 # 親番は入力どおりで、枝番が分からないだけなので、Jev に
                 # 「どの枝番か」を訊いても答えようがない。親番で確定する。
                 # 層1 の「大字はあるが丁目付きしか無い」と同じ構造。
+                #
+                # 数字の手前を読み飛ばしている場合（ABR に無い小字が残って
+                # いる等）は町字の解釈が不完全なので、ここでは確定させずに
+                # Jev へ回す。
                 parents = _parent_matches(entries, item.tail.numbers)
                 if parents:
                     item.entries = parents

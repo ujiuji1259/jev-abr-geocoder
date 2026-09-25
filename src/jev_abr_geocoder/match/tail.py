@@ -30,10 +30,14 @@ _CONTINUES = ("丁目", "丁", "番地", "番", "号", "地割", "の", "ノ")
 class Tail:
     """町字より後ろの部分。"""
 
-    #: 先頭から素直に読める数値列。層2 の絞り込みと突き合わせに使う。
+    #: 素直に読める数値列。層2 の絞り込みと突き合わせに使う。
     numbers: tuple[int, ...]
     #: 入力の残りそのもの。建物名を含んだまま Jev に渡す。
     raw: str
+    #: 数値の手前に読み飛ばした文字列。ABR に無い小字などが入る。
+    #: 空でなければ町字の解釈が不完全なので、番号をこちらで確定させず
+    #: Jev に判断させる。
+    skipped: str = ""
 
     @property
     def first(self) -> int | None:
@@ -50,15 +54,25 @@ def parse_tail(text: str) -> Tail:
     （建物名の始まり）が現れたら止める。止めたあとの文字列も ``raw`` には
     残っているので、Jev は全体を見て判断できる。
 
+    数字が先頭に無い場合は、**最初の数字まで読み飛ばす**。ABR の町字マスターに
+    無い小字が残ることがあるため（「福定町字灘屋敷179」の「字灘屋敷」）。
+    地番自体は町字の machiaza_id にぶら下がっているので、読み飛ばせば引ける。
+    読み飛ばした分は :attr:`Tail.skipped` に残し、呼び出し側が「町字の解釈が
+    不完全」と分かるようにする。
+
     >>> parse_tail("1-2-3〇〇ハイツ301").numbers
     (1, 2, 3)
     >>> parse_tail("1丁目2番3号").numbers
     (1, 2, 3)
+    >>> parse_tail("字灘屋敷179").numbers, parse_tail("字灘屋敷179").skipped
+    ((179,), '字灘屋敷')
     """
     raw = text
     work = _LEADING_JUNK.sub("", text)
+    first = _NUMBER.search(work)
+    skipped = work[: first.start()] if first else ""
     numbers: list[int] = []
-    pos = 0
+    pos = first.start() if first else 0
     while True:
         match = _NUMBER.match(work, pos)
         if match is None:
@@ -69,7 +83,7 @@ def parse_tail(text: str) -> Tail:
         if gap_end is None:
             break
         pos = gap_end
-    return Tail(numbers=tuple(numbers[:3]), raw=raw)
+    return Tail(numbers=tuple(numbers[:3]), raw=raw, skipped=skipped)
 
 
 def _next_number_start(work: str, pos: int) -> int | None:
