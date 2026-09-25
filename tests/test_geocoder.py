@@ -267,3 +267,41 @@ async def test_exact_number_still_wins(data_dir: Path, model: FakeModel) -> None
     assert result.level is Level.PARCEL
     assert result.prc_id == "000010000200000"
     assert "枝番" not in result.note
+
+
+async def test_many_queries_are_split_into_batches(data_dir: Path, model: FakeModel) -> None:
+    """呼び出し側が区切らなくても、batch_size ごとに分かれること。
+
+    区切らずに全部を 1 リクエストに入れると Choice の 255 件制限や
+    64k tokens/リクエストに当たる。
+    """
+    queries = ["鳥取県鳥取市面影1丁目1-2"] * 10
+    with _geocoder(data_dir, model, batch_size=4, concurrency=2, always_rerank=True) as geocoder:
+        results = await geocoder.geocode_many(queries)
+    assert len(results) == 10
+    # 10 件を 4 件ずつ = 3 バッチ。各バッチが町字と番号で最大 2 往復。
+    assert model.request_count <= 6
+    for _state, questions in model.calls:
+        assert len(questions) <= 4
+
+
+async def test_results_keep_the_input_order(data_dir: Path) -> None:
+    """並行に処理しても、返る順は入力順のまま。"""
+    queries = [
+        "鳥取県鳥取市面影一丁目1番2号",
+        "長崎県北松浦郡佐々町石木場免1-2",
+        "鳥取県",
+        "東京都目黒区自由が丘二丁目17-6",
+        "ここは住所ではありません",
+    ] * 3
+    with _geocoder(data_dir, None, batch_size=2, concurrency=3) as geocoder:
+        results = await geocoder.geocode_many(queries)
+    assert [r.query for r in results] == queries
+
+
+async def test_batch_statistics_are_merged(data_dir: Path, model: FakeModel) -> None:
+    with _geocoder(data_dir, model, batch_size=2, concurrency=2) as geocoder:
+        outcome = await geocoder.run_all(["鳥取県鳥取市面影一丁目1番2号"] * 6)
+    assert len(outcome.results) == 6
+    assert outcome.town_fast_path == 6
+    assert outcome.number_fast_path == 6

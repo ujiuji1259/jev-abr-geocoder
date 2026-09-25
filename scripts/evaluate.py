@@ -166,24 +166,22 @@ async def run(
     report = Report(total=len(queries))
     started = time.perf_counter()
     with Geocoder.open(data_dir, model=model, cfg=cfg) as geocoder:
-        for start in range(0, len(queries), cfg.batch_size):
-            batch = queries[start : start + cfg.batch_size]
-            outcome = await geocoder.run(batch)
-            report.town_fast_path += outcome.town_fast_path
-            report.number_fast_path += outcome.number_fast_path
-            for query, result in zip(batch, outcome.results, strict=True):
-                report.levels[result.level.label] += 1
-                report.resolved += bool(result.resolved)
-                if silver is not None and query in silver:
-                    expected = silver[query]
-                    if not expected:
-                        continue
-                    report.silver_total += 1
-                    got = _predicted_town(result)
-                    if got == expected:
-                        report.silver_correct += 1
-                    elif len(report.disagreements) < 40:
-                        report.disagreements.append((query, expected, got or "(なし)"))
+        outcome = await geocoder.run_all(queries)
+        report.town_fast_path = outcome.town_fast_path
+        report.number_fast_path = outcome.number_fast_path
+        for query, result in zip(queries, outcome.results, strict=True):
+            report.levels[result.level.label] += 1
+            report.resolved += bool(result.resolved)
+            if silver is not None and query in silver:
+                expected = silver[query]
+                if not expected:
+                    continue
+                report.silver_total += 1
+                got = _predicted_town(result)
+                if got == expected:
+                    report.silver_correct += 1
+                elif len(report.disagreements) < 40:
+                    report.disagreements.append((query, expected, got or "(なし)"))
     report.elapsed = time.perf_counter() - started
     if counter is not None:
         report.requests = counter.requests

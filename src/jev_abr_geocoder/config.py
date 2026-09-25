@@ -77,6 +77,13 @@ class GeocoderConfig:
     always_rerank: bool = False
     #: 1 リクエストにまとめる入力件数
     batch_size: int = 64
+    #: 並行して走らせるバッチ数。
+    #:
+    #: **処理時間の大半は Jev の応答待ち**なので、ここが実効速度をほぼ決める。
+    #: 鳥取県の法人 20,235 件では 1 本で 113.6 秒、4 本で 28.9 秒、8 本で
+    #: 16.8 秒だった。既定を 4 にしてあるのは Jev のレート制限
+    #: （1,200 リクエスト/分）に余裕を持たせるため。
+    concurrency: int = 4
     #: 候補が max_candidates を超えたとき、Jev で分割絞り込み (beam) を行う。
     #: False にすると従来どおり粒度を落とす。
     beam: bool = True
@@ -120,6 +127,8 @@ class GeocoderConfig:
             raise ValueError("max_options は 2..255 の範囲（Jev Choice の制約）")
         if self.batch_size < 1:
             raise ValueError("batch_size は 1 以上")
+        if self.concurrency < 1:
+            raise ValueError("concurrency は 1 以上")
 
 
 # --------------------------------------------------------------- 該当なし

@@ -105,6 +105,9 @@ def normalize(
     data_dir: DataDir = _DEFAULT_DATA_DIR,
     jsonl: Annotated[bool, typer.Option("--jsonl", help="JSON Lines で出力")] = False,
     batch_size: Annotated[int, typer.Option(help="1 リクエストにまとめる件数")] = 64,
+    concurrency: Annotated[
+        int, typer.Option(help="並行して走らせるバッチ数。処理時間は Jev の応答待ちが支配的")
+    ] = 4,
     no_model: Annotated[
         bool, typer.Option("--no-model", help="Jev を呼ばず、トライの候補だけで判定する")
     ] = False,
@@ -113,14 +116,17 @@ def normalize(
     ] = False,
 ) -> None:
     """住所を正規化する。"""
-    cfg = GeocoderConfig(batch_size=batch_size, always_rerank=always_rerank)
+    cfg = GeocoderConfig(
+        batch_size=batch_size, concurrency=concurrency, always_rerank=always_rerank
+    )
     queries = list(address) if address else [line.strip() for line in sys.stdin if line.strip()]
     if not queries:
         raise typer.BadParameter("住所が指定されていない")
 
     model = None if no_model else _open_model(cfg)
     with Geocoder.open(data_dir, model=model, cfg=cfg) as geocoder:
-        results = asyncio.run(_run_batches(geocoder, queries, cfg.batch_size))
+        # 区切りと並行化は Geocoder が面倒を見る。
+        results = asyncio.run(geocoder.geocode_many(queries))
 
     for result in results:
         if jsonl:
@@ -161,16 +167,6 @@ def _open_model(cfg: GeocoderConfig) -> DecisionModel | None:
         )
         return None
     return JevModel.from_env(cfg)
-
-
-async def _run_batches(
-    geocoder: Geocoder, queries: list[str], batch_size: int
-) -> list[GeocodeResult]:
-    results: list[GeocodeResult] = []
-    for start in range(0, len(queries), batch_size):
-        batch = queries[start : start + batch_size]
-        results.extend(await geocoder.geocode_many(batch))
-    return results
 
 
 def _human(result: GeocodeResult) -> str:

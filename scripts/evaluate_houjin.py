@@ -153,14 +153,12 @@ async def run(data_dir: Path, cases: list[Case], cfg: GeocoderConfig, *, use_mod
     report = Report(total=len(cases))
     started = time.perf_counter()
     with Geocoder.open(data_dir, model=model, cfg=cfg) as geocoder:
-        for i in range(0, len(cases), cfg.batch_size):
-            batch = cases[i : i + cfg.batch_size]
-            outcome = await geocoder.run([c.query for c in batch])
-            report.town_fast_path += outcome.town_fast_path
-            report.number_fast_path += outcome.number_fast_path
-            report.beam_requests += outcome.beam_requests
-            for case, result in zip(batch, outcome.results, strict=True):
-                _record(report, case, result)
+        outcome = await geocoder.run_all([c.query for c in cases])
+        report.town_fast_path = outcome.town_fast_path
+        report.number_fast_path = outcome.number_fast_path
+        report.beam_requests = outcome.beam_requests
+        for case, result in zip(cases, outcome.results, strict=True):
+            _record(report, case, result)
     report.elapsed = time.perf_counter() - started
     if counter is not None:
         report.requests = counter.requests
@@ -262,13 +260,18 @@ def main() -> None:
         help="ファストパスを無効化して全件 Jev を通す（閾値を測るとき用）",
     )
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--jsonl", type=Path)
     args = parser.parse_args()
 
     cases = load_cases(args.csv, args.limit)
     if not cases:
         parser.error(f"読み込めなかった: {args.csv}")
-    cfg = GeocoderConfig(batch_size=args.batch_size, always_rerank=args.always_rerank)
+    cfg = GeocoderConfig(
+        batch_size=args.batch_size,
+        concurrency=args.concurrency,
+        always_rerank=args.always_rerank,
+    )
     report = asyncio.run(run(args.data_dir, cases, cfg, use_model=args.model))
     print_report(report, "Jev あり" if args.model else "Jev なし（トライのみ）")
     if args.jsonl:
