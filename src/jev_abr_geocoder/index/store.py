@@ -18,7 +18,7 @@ from . import numblob
 
 __all__ = ["Store", "SCHEMA_VERSION", "DB_FILENAME"]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DB_FILENAME = "abr.db"
 
 _SCHEMA = """
@@ -68,12 +68,15 @@ CREATE TABLE IF NOT EXISTS town(
     koaza         TEXT NOT NULL,
     rsdt_addr_flg INTEGER NOT NULL,
     lat_1e7       INTEGER,
-    lon_1e7       INTEGER
+    lon_1e7       INTEGER,
+    -- 'abr' か 'geolonia'。geolonia の行は ABR に無い町字を補うもので、
+    -- machiaza_id を持たないため層2（街区・住居番号・地番）は引けない。
+    source        TEXT NOT NULL DEFAULT 'abr'
 );
 -- 同じ町字を 2 行に分けない。mt_town は住居表示と地番の両方を持つ町字を
 -- rsdt_addr_flg 違いの 2 行で収録しているが、取り込み時に 1 行へまとめる。
 -- 分かれていると表示が同一の選択肢を Jev に見せることになり、答えようがない。
-CREATE UNIQUE INDEX IF NOT EXISTS town_by_machiaza ON town(lg_code, machiaza_id);
+CREATE UNIQUE INDEX IF NOT EXISTS town_by_machiaza ON town(lg_code, machiaza_id, source);
 
 -- 街区・住居番号・地番。町字単位でパックした BLOB（numblob.py の形式）。
 CREATE TABLE IF NOT EXISTS num_blob(
@@ -85,6 +88,21 @@ CREATE TABLE IF NOT EXISTS num_blob(
     PRIMARY KEY(lg_code, machiaza_id, kind)
 ) WITHOUT ROWID;
 """
+
+
+def _schema_version(path: Path) -> int | None:
+    """既存 DB のスキーマ版。読めなければ None。"""
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        return int(row[0]) if row else None
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+    finally:
+        conn.close()
 
 
 def _point(lat_1e7: int | None, lon_1e7: int | None) -> Point | None:
@@ -117,7 +135,13 @@ class Store:
 
     @classmethod
     def create(cls, path: Path) -> Store:
-        """書き込み用に開き、構築向けの PRAGMA を設定する。"""
+        """書き込み用に開き、構築向けの PRAGMA を設定する。
+
+        スキーマ版が変わっていたら作り直す。索引は ABR から何度でも組み直せる
+        ので、移行を書くより捨てて作り直すほうが単純で確実。
+        """
+        if path.exists() and _schema_version(path) != SCHEMA_VERSION:
+            path.unlink()
         store = cls.open(path, readonly=False)
         # 構築中はクラッシュしても作り直せばよいので、耐久性より速度を取る。
         store._conn.execute("PRAGMA journal_mode = OFF")
@@ -190,7 +214,7 @@ class Store:
     def replace_towns(self, rows: Iterable[Sequence[Any]]) -> None:
         self._conn.execute("DELETE FROM town")
         self._conn.executemany(
-            "INSERT INTO town VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
+            "INSERT INTO town VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
         )
 
     def put_numbers(
@@ -316,6 +340,7 @@ def _town_record(row: sqlite3.Row) -> TownRecord:
         koaza=str(row["koaza"]),
         rsdt_addr_flg=int(row["rsdt_addr_flg"]),
         point=_point(row["lat_1e7"], row["lon_1e7"]),
+        source=str(row["source"]),
     )
 
 

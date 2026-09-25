@@ -116,6 +116,9 @@ class TownRecord:
     koaza: str
     rsdt_addr_flg: int
     point: Point | None = None
+    #: この行の出所。``"abr"`` か ``"geolonia"``。
+    #: geolonia の行は ABR に無い町字を補うもので、machiaza_id を持たない。
+    source: str = "abr"
 
     @property
     def town(self) -> str:
@@ -134,9 +137,13 @@ class TownRecord:
         return f"{self.pref}{self.county}{self.city}{self.ward}{self.oaza_cho}"
 
     @property
+    def from_abr(self) -> bool:
+        return self.source == "abr"
+
+    @property
     def machiaza_code(self) -> str:
-        """ABR 表記の 7 桁 machiaza_id。"""
-        return f"{self.machiaza_id:07d}"
+        """ABR 表記の 7 桁 machiaza_id。ABR 由来でなければ空。"""
+        return f"{self.machiaza_id:07d}" if self.from_abr else ""
 
     @property
     def lg_code_str(self) -> str:

@@ -300,6 +300,10 @@ class Geocoder:
             tail = item.tail
             if town is None or tail is None or not tail.numbers:
                 continue
+            if not town.from_abr:
+                # Geolonia から補った町字は ABR の machiaza_id を持たないので、
+                # 層2（街区・住居番号・地番）を引けない。町字で止める。
+                continue
             if not self._town_is_confident(item):
                 continue
             kind = town.number_kind

@@ -182,6 +182,7 @@ def data_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
                     town.rsdt_addr_flg,
                     round(town.lat * _SCALE),
                     round(town.lon * _SCALE),
+                    "abr",
                 )
             )
             name = TownName(

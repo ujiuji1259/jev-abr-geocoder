@@ -49,6 +49,13 @@ def build(
     ] = None,
     concurrency: Annotated[int, typer.Option(help="同時ダウンロード数")] = 4,
     force: Annotated[bool, typer.Option("--force", help="変更が無くても再取り込み")] = False,
+    geolonia: Annotated[
+        bool,
+        typer.Option(
+            "--geolonia/--no-geolonia",
+            help="ABR に無い町字を Geolonia 住所データ (CC BY 4.0) で補う",
+        ),
+    ] = True,
 ) -> None:
     """ABR を取り込んで索引を作る。再実行すると差分だけを取り込む。"""
     from .abr.catalog import BuildLevel
@@ -70,6 +77,7 @@ def build(
             cities=city or None,
             concurrency=concurrency,
             force=force,
+            with_geolonia=geolonia,
             progress=progress,
         )
     )
@@ -82,6 +90,7 @@ def build(
                 f"都道府県      : {report.prefs:,}",
                 f"市区町村      : {report.cities:,}",
                 f"町字          : {report.towns:,}  (索引鍵 {report.trie_keys:,})",
+                f"  うち Geolonia: {report.geolonia_towns:,}",
                 f"番号          : {report.numbers:,}",
                 f"所要          : {report.elapsed:.1f} 秒",
             ]
@@ -136,6 +145,9 @@ def info(data_dir: DataDir = _DEFAULT_DATA_DIR) -> None:
         lines.append(f"町字        : {store.town_count():,}")
         lines.append(f"番号        : {store.number_count():,}")
         lines.append(f"取り込み済み: {len(store.ingested_sources()):,} ファイル")
+        if "geolonia_attribution" in meta:
+            lines.append("")
+            lines.append(meta["geolonia_attribution"])
     typer.echo("\n".join(lines))
 
 
