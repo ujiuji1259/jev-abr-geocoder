@@ -249,7 +249,7 @@ class Geocoder:
         for item in items:
             if not item.entries or item.town is None or item.tail is None:
                 continue
-            entries = _rank_entries(item.entries, item.tail.numbers, self._cfg.max_options)
+            entries = _rank_entries(item.entries, item.tail.numbers, self._cfg.max_candidates)
             exact = [e for e in entries if e.numbers == item.tail.numbers]
             if len(exact) == 1 and not self._cfg.always_rerank:
                 # 入力の数値列が実在レコードと完全一致。選ぶ余地が無い。

@@ -161,10 +161,17 @@ class Reranker:
         )
 
 
+#: Jev の Choice が受け付けるオプション数の上限（API の制約）。
+MAX_CHOICE_OPTIONS = 255
+
+
 def _choice(instructions: Mapping[str, Any], options: Sequence[str], label: str) -> Any:
     from typesafe_sdk import Choice
 
-    criteria: dict[str, Any] = {_option_id(i): {label: text} for i, text in enumerate(options)}
+    # NONE_OPTION のぶん 1 枠を残す。呼び出し側が守っているはずだが、
+    # 超えると API が 400 を返して**バッチ全体が失敗する**ので、ここでも守る。
+    capped = options[: MAX_CHOICE_OPTIONS - 1]
+    criteria: dict[str, Any] = {_option_id(i): {label: text} for i, text in enumerate(capped)}
     criteria[NONE_OPTION] = NONE_OPTION_DESCRIPTION
     return Choice(instructions=dict(instructions), criteria=criteria)
 

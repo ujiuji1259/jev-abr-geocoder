@@ -142,3 +142,21 @@ def test_unknown_city_yields_pref_only(index: TownIndex) -> None:
     assert found.candidates == []
     assert found.pref_lg_code is not None
     assert found.city_id is None
+
+
+def test_prefix_match_never_splits_a_number(index: TownIndex) -> None:
+    """丁目省略のエイリアスが地番の先頭を食わないこと。
+
+    「面影1」という鍵は「面影1189-4」の先頭 1 文字にも当たるが、
+    1189 は 1 つの数字トークンなので途中で切ってはいけない。
+    切ると「面影一丁目の189」という存在しない住所になる。
+    """
+    displays = _displays(index, normalize("鳥取県鳥取市面影1189-4"))
+    assert "鳥取県鳥取市面影" in displays
+    assert "鳥取県鳥取市面影一丁目" not in displays
+
+
+def test_chome_omission_still_matches_at_a_separator(index: TownIndex) -> None:
+    """区切りで終わっていれば丁目省略の一致は有効。"""
+    displays = _displays(index, normalize("鳥取県鳥取市面影1-1-2"))
+    assert "鳥取県鳥取市面影一丁目" in displays

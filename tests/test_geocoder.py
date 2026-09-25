@@ -181,3 +181,27 @@ async def test_kanji_chome_resolves_end_to_end(data_dir: Path) -> None:
         result = await geocoder.geocode("東京都目黒区自由が丘二丁目17-6")
     assert result.machiaza_id == "0013002"
     assert result.level is Level.MACHIAZA
+
+
+async def test_choice_never_exceeds_the_api_limit(data_dir: Path, model: FakeModel) -> None:
+    """Choice の選択肢は「該当なし」を含めて 255 件を超えてはならない。
+
+    超えると API が 400 を返し、**バッチ全体が失敗する**。候補を 255 件に
+    切ってから NONE_OPTION を足して 256 になる off-by-one を踏んだので、
+    ここで固定する。
+    """
+    from jev_abr_geocoder.match.rerank import MAX_CHOICE_OPTIONS
+
+    with _geocoder(data_dir, model, always_rerank=True) as geocoder:
+        await geocoder.geocode("東京都目黒区自由が丘")
+    assert model.calls, "Jev が呼ばれていない"
+    for _state, questions in model.calls:
+        for question in questions.values():
+            assert len(question.criteria) <= MAX_CHOICE_OPTIONS
+
+
+def test_max_candidates_leaves_room_for_the_none_option() -> None:
+    from jev_abr_geocoder.config import GeocoderConfig
+
+    cfg = GeocoderConfig()
+    assert cfg.max_candidates == cfg.max_options - 1

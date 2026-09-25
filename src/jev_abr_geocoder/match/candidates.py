@@ -34,6 +34,21 @@ __all__ = ["CandidateFinder", "CandidateSet"]
 _TRAILING_NUMBER = re.compile(r"[\d\-ー−–—―‐]+$")
 
 
+def _splits_a_number(key: str, text: str) -> bool:
+    """索引鍵が入力の数字列を途中で切っているか。
+
+    丁目を省略したエイリアス（「鎌倉市岡本1」）は、地番の先頭の数字にも
+    当たってしまう。「鎌倉市岡本1189-4」は *大字岡本の 1189 番地* であって
+    *岡本一丁目の 189* ではないのに、長いほうが勝つ規則のせいで誤って
+    一丁目に確定していた。
+
+    数字列はそれ自体が 1 つのトークンなので、その途中で切れる一致は成立しない。
+    これは類似度の判断ではなく字句の規則。
+    """
+    tail = text[len(key) : len(key) + 1]
+    return bool(key) and key[-1].isdigit() and tail.isdigit()
+
+
 @dataclass(frozen=True, slots=True)
 class CandidateSet:
     candidates: list[TownCandidate]
@@ -91,7 +106,7 @@ class CandidateFinder:
         seen: set[int] = set()
         out: list[TownCandidate] = []
         for hit in hits:  # 長い順
-            if hit.town_id in seen:
+            if hit.town_id in seen or _splits_a_number(hit.key, normalized):
                 continue
             seen.add(hit.town_id)
             out.append(
@@ -103,7 +118,7 @@ class CandidateFinder:
                     score=hit.matched_len / len(normalized),
                 )
             )
-            if len(out) >= self._cfg.max_options:
+            if len(out) >= self._cfg.max_candidates:
                 break
         city = self._index.city_prefixes(normalized)
         return CandidateSet(candidates=out, exact=True, city_id=city[0].city_id if city else None)
@@ -153,7 +168,7 @@ class CandidateFinder:
             stems.append(stripped)
 
         for stem in stems:
-            keys = self._index.keys_under(stem, self._cfg.max_options * 4)
+            keys = self._index.keys_under(stem, self._cfg.max_candidates * 4)
             if not keys:
                 continue
             # 入力からの継ぎ足しが短いものほど「言いかけ」に近い。
@@ -174,7 +189,7 @@ class CandidateFinder:
                         score=len(stem) / max(1, len(key)),
                     )
                 )
-                if len(out) >= self._cfg.max_options:
+                if len(out) >= self._cfg.max_candidates:
                     break
             city = self._index.city_prefixes(normalized)
             return CandidateSet(
