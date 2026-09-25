@@ -67,6 +67,8 @@ class _Item:
     entries: list[NumberEntry] = field(default_factory=list)
     number_decision: Decision | None = None
     kind: NumberKind | None = None
+    #: 入力が親番までで、枝番は ABR にしか無い場合 True。
+    number_parent: bool = False
 
 
 class Geocoder:
@@ -310,16 +312,20 @@ class Geocoder:
             entries = self._index.store.fetch_numbers(
                 town.lg_code, town.machiaza_id, kind, num1=tail.first
             )
-            if not entries and kind is NumberKind.RSDT:
-                # 住居表示実施区域でも街区までしか無い町字、また住居表示と地番の
-                # 両方を持つ町字（全国 1,248 件）があるので順に落とす。
+            if kind is NumberKind.RSDT and not _has_exact(entries, tail.numbers):
+                # 住居表示実施区域でも街区までしか無い町字、住居表示と地番の
+                # 両方を持つ町字（全国 1,248 件）、そして「街区だけ入力されて
+                # 住居番号が無い」場合があるので順に落とす。
                 for fallback in (NumberKind.BLOCK, NumberKind.PARCEL):
-                    entries = self._index.store.fetch_numbers(
+                    alternative = self._index.store.fetch_numbers(
                         town.lg_code, town.machiaza_id, fallback, num1=tail.first
                     )
-                    if entries:
-                        kind = fallback
+                    if _has_exact(alternative, tail.numbers):
+                        entries, kind = alternative, fallback
                         break
+                    entries = entries or alternative
+                    if entries is alternative and alternative:
+                        kind = fallback
             item.entries = entries
             item.kind = kind
 
@@ -333,6 +339,25 @@ class Geocoder:
                 continue
             entries = _rank_entries(item.entries, item.tail.numbers, self._cfg.max_candidates)
             exact = [e for e in entries if e.numbers == item.tail.numbers]
+            if not exact and not self._cfg.always_rerank:
+                # **入力が候補の番号列の先頭になっている。** 「中砂見936番地」に
+                # 対し ABR は 936-1 / 936-2 / 936-3 しか持たない、という型。
+                # 親番は入力どおりで、枝番が分からないだけなので、Jev に
+                # 「どの枝番か」を訊いても答えようがない。親番で確定する。
+                # 層1 の「大字はあるが丁目付きしか無い」と同じ構造。
+                parents = _parent_matches(entries, item.tail.numbers)
+                if parents:
+                    item.entries = parents
+                    item.number_parent = True
+                    item.number_decision = Decision(
+                        index=0,
+                        probability=1.0,
+                        confidence=1.0,
+                        contains_answer=1.0,
+                        fast_path=True,
+                    )
+                    outcome.number_fast_path += 1
+                    continue
             if len(exact) == 1 and not self._cfg.always_rerank:
                 # 入力の数値列が実在レコードと完全一致。選ぶ余地が無い。
                 item.entries = exact
@@ -447,13 +472,19 @@ class Geocoder:
 
         entry = item.entries[decision.index]
         kind = item.kind or town.number_kind
-        result.number = _format_number(kind, entry)
-        result.level = kind.level
+        numbers = item.tail.numbers if (item.number_parent and item.tail) else entry.numbers
+        result.number = _format_number(kind, numbers)
+        result.level = _level_for(kind, numbers)
         result.confidence = decision.confidence
         result.probability = decision.probability
         if entry.point is not None:
             result.point = entry.point
-        if kind is NumberKind.PARCEL:
+        if item.number_parent:
+            # 枝番は入力に無いので ABR の ID は付けない。座標は代表のもの。
+            result.note = result.note or (
+                f"枝番は入力に含まれない。{len(item.entries)} 件のうち代表の座標"
+            )
+        elif kind is NumberKind.PARCEL:
             result.prc_id = entry.prc_id()
         else:
             result.blk_id = entry.blk_id()
@@ -571,13 +602,47 @@ def _low_confidence_note(what: str, decision: Decision, guess: str) -> str:
     return f"{what}の確信度が低い ({decision.confidence:.2f}): 最有力は {guess}"
 
 
-def _format_number(kind: NumberKind, entry: NumberEntry) -> str:
+def _level_for(kind: NumberKind, numbers: Sequence[int]) -> Level:
+    """入力がどこまで特定できたかに応じた粒度。
+
+    住居表示で街区しか与えられていないとき (「面影一丁目1番」) は、住居番号
+    ではなく街区として返す。地番は枝番が無くても地番のまま。
+    """
+    if kind is NumberKind.RSDT and len(tuple(numbers)) < 2:
+        return Level.BLOCK
+    return kind.level
+
+
+def _has_exact(entries: Sequence[NumberEntry], numbers: Sequence[int]) -> bool:
+    target = tuple(numbers)
+    return any(e.numbers == target for e in entries)
+
+
+def _parent_matches(entries: Sequence[NumberEntry], numbers: Sequence[int]) -> list[NumberEntry]:
+    """入力の番号列を先頭に持つ候補。入力が親番までのときに使う。
+
+    「中砂見936番地」(936,) に対して 936-1 / 936-2 / 936-3 が返る。番号の
+    並びとしては入力どおりで、枝番が分からないだけなので、どれを選ぶかを
+    Jev に訊いても答えようがない。
+    """
+    target = tuple(numbers)
+    if not target:
+        return []
+    return [e for e in entries if e.numbers[: len(target)] == target and e.numbers != target]
+
+
+def _format_number(kind: NumberKind, numbers: Sequence[int]) -> str:
+    parts: tuple[int, ...] = tuple(numbers)
+    if len(parts) == 0:
+        return ""
     if kind is NumberKind.BLOCK:
-        return f"{entry.num1}番"
+        return f"{parts[0]}番"
     if kind is NumberKind.RSDT:
-        parts = f"{entry.num1}番{entry.num2}号"
-        return parts + (f"の{entry.num3}" if entry.num3 else "")
-    return f"{entry.display}番地"
+        if len(parts) < 2:
+            return f"{parts[0]}番"
+        out = f"{parts[0]}番{parts[1]}号"
+        return out + (f"の{parts[2]}" if len(parts) > 2 and parts[2] else "")
+    return "-".join(str(n) for n in parts) + "番地"
 
 
 #: 番号の直後に付く助数詞。採用した番号と一緒に消費する。

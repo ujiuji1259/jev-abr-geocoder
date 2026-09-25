@@ -230,3 +230,40 @@ async def test_beam_disabled_falls_back_to_city(data_dir: Path, model: FakeModel
         result = await geocoder.geocode("鳥取県鳥取市面かげ1丁目1-2")
     assert result.level <= Level.CITY
     assert model.request_count == 0
+
+
+async def test_parent_parcel_number_resolves_without_jev(data_dir: Path, model: FakeModel) -> None:
+    """親番だけ入力され、ABR には枝番付きしか無い場合。
+
+    「石木場免1番地」に対し ABR は 1-1 / 1-2 しか持たない。番号の並びとしては
+    入力どおりで枝番が分からないだけなので、どれを選ぶかを Jev に訊いても
+    答えようがない。親番で確定する。層1 の「大字はあるが丁目付きしか無い」と
+    同じ構造。実データ（鳥取県の法人 20,235 件）では、これで番号到達率が
+    88.8% から 95.1% に上がった。
+    """
+    with _geocoder(data_dir, model) as geocoder:
+        result = await geocoder.geocode("長崎県北松浦郡佐々町石木場免1番地")
+    assert model.request_count == 0
+    assert result.level is Level.PARCEL
+    assert result.number == "1番地"
+    assert result.prc_id == ""  # 枝番が分からないので ABR の ID は付けない
+    assert "枝番" in result.note
+    assert result.lat is not None
+
+
+async def test_block_only_input_resolves_at_block(data_dir: Path, model: FakeModel) -> None:
+    """住居表示で街区しか与えられていないときは街区として返す。"""
+    with _geocoder(data_dir, model) as geocoder:
+        result = await geocoder.geocode("鳥取県鳥取市面影一丁目1番")
+    assert model.request_count == 0
+    assert result.level is Level.BLOCK
+    assert result.number == "1番"
+
+
+async def test_exact_number_still_wins(data_dir: Path, model: FakeModel) -> None:
+    """完全一致があるときは親番に落とさない。"""
+    with _geocoder(data_dir, model) as geocoder:
+        result = await geocoder.geocode("長崎県北松浦郡佐々町石木場免1-2")
+    assert result.level is Level.PARCEL
+    assert result.prc_id == "000010000200000"
+    assert "枝番" not in result.note
