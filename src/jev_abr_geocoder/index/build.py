@@ -44,6 +44,42 @@ _KIND_TO_NUMBER: dict[str, NumberKind] = {
 
 
 @dataclass(slots=True)
+class _TownRow:
+    """``town`` テーブルの 1 行。重複をまとめる間だけ可変で持つ。"""
+
+    town_id: int
+    lg_code: int
+    machiaza_id: int
+    pref: str
+    county: str
+    city: str
+    ward: str
+    oaza_cho: str
+    chome: str
+    koaza: str
+    rsdt_addr_flg: int
+    lat_1e7: int | None
+    lon_1e7: int | None
+
+    def as_tuple(self) -> tuple[object, ...]:
+        return (
+            self.town_id,
+            self.lg_code,
+            self.machiaza_id,
+            self.pref,
+            self.county,
+            self.city,
+            self.ward,
+            self.oaza_cho,
+            self.chome,
+            self.koaza,
+            self.rsdt_addr_flg,
+            self.lat_1e7,
+            self.lon_1e7,
+        )
+
+
+@dataclass(slots=True)
 class BuildReport:
     level: BuildLevel
     files_selected: int = 0
@@ -176,8 +212,14 @@ def _build_towns(
 ) -> tuple[int, int]:
     """``town`` テーブルと ``town.marisa`` を作る。(町字数, 鍵数) を返す。"""
     positions = _load_town_positions(pos)
-    rows: list[tuple[object, ...]] = []
+    rows: list[_TownRow] = []
     pairs: list[tuple[str, tuple[int]]] = []
+    # (lg_code, machiaza_id) -> town_id。
+    # mt_town は住居表示と地番の両方を持つ町字を rsdt_addr_flg 違いの 2 行で
+    # 収録している（全国 727,405 行中 1,248 組）。そのまま取り込むと **表示が
+    # まったく同じ選択肢を Jev に 2 つ見せる**ことになり、答えようがないので
+    # 確信度が割れて粒度が落ちる。同じ町字なので 1 行にまとめる。
+    by_machiaza: dict[tuple[int, int], int] = {}
 
     for path in text:
         for row in csvsrc.read_rows(path):
@@ -207,28 +249,40 @@ def _build_towns(
             )
             lat, lon = coords if coords else (None, None)
 
+            slot = (lg_code, machiaza_id)
+            existing = by_machiaza.get(slot)
+            if existing is not None:
+                # 住居表示がある側を採る。番号の取得は RSDT -> BLOCK -> PARCEL と
+                # 順に試すので、1 に寄せても地番しか無い場合は拾える。
+                merged = rows[existing]
+                merged.rsdt_addr_flg = max(merged.rsdt_addr_flg, flg)
+                if merged.lat_1e7 is None:
+                    merged.lat_1e7, merged.lon_1e7 = lat, lon
+                continue
+
             town_id = len(rows)
+            by_machiaza[slot] = town_id
             rows.append(
-                (
-                    town_id,
-                    lg_code,
-                    machiaza_id,
-                    name.pref,
-                    name.county,
-                    name.city,
-                    name.ward,
-                    name.oaza_cho,
-                    name.chome,
-                    name.koaza,
-                    flg,
-                    lat,
-                    lon,
+                _TownRow(
+                    town_id=town_id,
+                    lg_code=lg_code,
+                    machiaza_id=machiaza_id,
+                    pref=name.pref,
+                    county=name.county,
+                    city=name.city,
+                    ward=name.ward,
+                    oaza_cho=name.oaza_cho,
+                    chome=name.chome,
+                    koaza=name.koaza,
+                    rsdt_addr_flg=flg,
+                    lat_1e7=lat,
+                    lon_1e7=lon,
                 )
             )
             payload = (town_id,)
             pairs.extend((alias, payload) for alias in aliases)
 
-    store.replace_towns(rows)
+    store.replace_towns([r.as_tuple() for r in rows])
 
     # サーバが読んでいる最中でも壊れないよう、一時ファイルに書いて差し替える。
     trie = build_trie(pairs)
@@ -250,11 +304,12 @@ def _number_fields(kind: NumberKind, row: dict[str, str]) -> tuple[int, int, int
             int(row.get("rsdt_num") or 0),
             int(row.get("rsdt_num2") or 0),
         )
-    return (
-        int(row.get("prc_num1") or 0),
-        int(row.get("prc_num2") or 0),
-        int(row.get("prc_num3") or 0),
-    )
+    # 地番は prc_num* ではなく prc_id から取る。
+    # 「い2」「ﾂ4」のようないろは地番があり、prc_num* は数値とは限らない
+    # （鳥取県 2,137,980 筆中 8 件）。prc_id は常に 15 桁の数字で、ABR 自身が
+    # それらを符号化した値を持つので、こちらを唯一の出所にする。
+    prc_id = row["prc_id"]
+    return int(prc_id[0:5]), int(prc_id[5:10]), int(prc_id[10:15])
 
 
 def _record_key(kind: NumberKind, row: dict[str, str]) -> int:

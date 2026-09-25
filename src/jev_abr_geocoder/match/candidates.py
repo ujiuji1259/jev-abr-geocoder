@@ -3,20 +3,25 @@
 **トライは再現率だけを担保する。** 正解を候補集合に含めることにだけ責任を持ち、
 どれが正解かの判断はしない（docs/architecture.md 原則1）。
 
-探索は 2 方向の**完全一致**だけで、曖昧一致はしない。
+絞り込みは**完全一致だけ**で行い、類似度の計算はしない。
 
 1. **索引鍵が入力の先頭** — ふつうの前方一致。入力の 99.6% はここで決まる
 2. **入力が市区町村・都道府県ちょうどで終わる** — 町字を探す余地が無い
 3. **入力が索引鍵の先頭** — 入力が途中で終わっている（丁目や小字の省略）。
    末尾の番地を削ってからもう一度試す
+4. **どれも当たらない** — その市区町村の町字を**全部** Jev に渡して選ばせる。
+   誤字・異体字はここ。どれが入力の意図かを選ぶのはまさに Jev の仕事なので、
+   こちらでは絞り込まない
+5. 町字数が 255 件を超えて渡しきれない市区町村だけ、粒度を落とす
 
-どちらも当たらない誤字・異体字は、**町字を諦めて市区町村の粒度で返す**。
+**編集距離は持たない。** 以前は 4 の代わりに編集距離で候補を絞っていたが、
+実測で割に合わなかった。geolonia の難例 7,191 件で、曖昧一致に落ちるのは
+0.3%、そのうち正解を候補に含められたのは 44%。実質 0.15% を拾うために
+全件のレイテンシが 25 倍（17 µs → 433 µs）になり、さらに「叶」「嶋」「新」の
+ような 1 文字の町名が距離 1 で上位を占めて候補集合を汚していた。
 
-以前は編集距離によるフォールバックを持っていたが、実測で割に合わなかった。
-geolonia の難例 7,191 件では、曖昧一致に落ちるのは 0.3% でそのうち正解を
-候補に含められたのは 44%。実質 0.15% を拾うために全件のレイテンシが
-25 倍（17 µs → 433 µs）になり、さらに「叶」「嶋」「新」のような 1 文字の町名が
-距離 1 で上位を占めて候補集合を汚していた。
+4 はその置き換えで、**絞り込みを諦めて判断を Jev に渡す**ほうが筋が良い。
+異体字の同定は Jev の得意分野であり、こちらが距離で順位づけする筋合いがない。
 """
 
 from __future__ import annotations
@@ -32,6 +37,12 @@ __all__ = ["CandidateFinder", "CandidateSet"]
 
 #: 末尾の番地らしき部分。入力が索引鍵の先頭かを試す前にここだけ削る。
 _TRAILING_NUMBER = re.compile(r"[\d\-ー−–—―‐]+$")
+
+
+def _first_digit_after(text: str, start: int) -> int:
+    """``start`` 以降で最初に数字が現れる位置。無ければ文字列長。"""
+    match = re.compile(r"\d").search(text, start)
+    return match.start() if match else len(text)
 
 
 def _splits_a_number(key: str, text: str) -> bool:
@@ -91,7 +102,7 @@ class CandidateFinder:
             return CandidateSet(candidates=[], exact=False)
         # 候補が空でも意味のある結果（市区町村で確定など）を返す段があるので、
         # 真偽値ではなく None かどうかで分岐する。
-        for step in (self._forward, self._boundary, self._extensions):
+        for step in (self._forward, self._boundary, self._extensions, self._city_wide):
             found = step(normalized)
             if found is not None:
                 return found
@@ -197,14 +208,59 @@ class CandidateFinder:
             )
         return None
 
-    # ------------------------------------------- ④ 粒度を落とす
+    # --------------------------------- ④ 市区町村配下を総当たりで Jev に渡す
+
+    def _city_wide(self, normalized: str) -> CandidateSet | None:
+        """完全一致がどれも当たらなかったとき、その市区町村の町字を全部渡す。
+
+        誤字・異体字（「箪笥町」と「簞笥町」、「緑が浜」と「緑ヶ浜」、
+        「7番町」と「七番丁」）はここに来る。**どれが入力の意図かを選ぶのは
+        まさに Jev の仕事**なので、絞り込みをせずに選択肢として並べる。
+
+        ここでは順位づけも足切りもしない。市区町村が決まっていれば母集団は
+        高々その町字数で、74% の市区町村は 255 件に収まる。収まらない場合は
+        何を落とすかの判断が要ってしまうので、**手を出さずに粒度を落とす**
+        （§11 の未解決事項）。
+
+        全体の 0.3% しか通らない経路なので、上限いっぱいの選択肢を渡しても
+        コストは無視できる。
+        """
+        city_hits = self._index.city_prefixes(normalized)
+        if not city_hits:
+            return None
+        best = city_hits[0]
+        limit = self._cfg.max_candidates
+        # 上限を 1 件でも超えたら諦めるため、limit + 1 件まで取って判定する。
+        keys = self._index.keys_under(best.key, (limit + 1) * 8)
+        seen: dict[int, str] = {}
+        for key, town_id in keys:
+            if town_id not in seen:
+                seen[town_id] = key
+            if len(seen) > limit:
+                return None
+        if not seen:
+            return None
+
+        # 町字がどこで終わるかは異体字のせいで文字単位には合わせられない。
+        # 住所は町字の直後に番地が来るので、市区町村より後ろの最初の数字を
+        # 切れ目とする。文字の照合ではなく位置の規則。
+        cut = _first_digit_after(normalized, best.matched_len)
+        remainder = normalized[cut:]
+        matched = normalized[:cut]
+        candidates = [
+            TownCandidate(town_id=town_id, matched=matched, remainder=remainder, score=0.0)
+            for town_id in seen
+        ]
+        return CandidateSet(candidates=candidates, exact=False, city_id=best.city_id)
+
+    # ------------------------------------------- ⑤ 粒度を落とす
 
     def _coarse(self, normalized: str) -> CandidateSet:
-        """町字が取れないとき、分かるところまでを返す。
+        """町字が取れず、市区町村の町字を並べることもできないとき。
 
-        誤字・異体字（「箪笥町」と「簞笥町」、「緑が浜」と「緑ヶ浜」）はここに
-        来る。かつては編集距離で拾おうとしていたが、再現率 44% に対して
-        全件のレイテンシが 25 倍になるため止めた。
+        町字数が 255 件を超える市区町村（全体の 26%、最大は福井市の 15,399 件）
+        で誤字が来た場合がここ。何を候補から落とすかの判断が必要になるので、
+        今は手を出さずに市区町村の粒度で返す。
         """
         city_hits = self._index.city_prefixes(normalized)
         if city_hits:

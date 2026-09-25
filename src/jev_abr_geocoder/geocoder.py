@@ -232,12 +232,15 @@ class Geocoder:
                 town.lg_code, town.machiaza_id, kind, num1=tail.first
             )
             if not entries and kind is NumberKind.RSDT:
-                # 住居表示実施区域でも街区までしか無いことがある。
-                entries = self._index.store.fetch_numbers(
-                    town.lg_code, town.machiaza_id, NumberKind.BLOCK, num1=tail.first
-                )
-                if entries:
-                    kind = NumberKind.BLOCK
+                # 住居表示実施区域でも街区までしか無い町字、また住居表示と地番の
+                # 両方を持つ町字（全国 1,248 件）があるので順に落とす。
+                for fallback in (NumberKind.BLOCK, NumberKind.PARCEL):
+                    entries = self._index.store.fetch_numbers(
+                        town.lg_code, town.machiaza_id, fallback, num1=tail.first
+                    )
+                    if entries:
+                        kind = fallback
+                        break
             item.entries = entries
             item.kind = kind
 

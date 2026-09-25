@@ -41,16 +41,30 @@ def test_alias_lets_county_be_omitted(index: TownIndex) -> None:
     assert "長崎県北松浦郡佐々町石木場免" in _displays(index, normalize("佐々町石木場免1-1"))
 
 
-def test_typo_gives_up_at_city_level(index: TownIndex) -> None:
-    """誤字は町字を諦めて市区町村で返す。
+def test_typo_hands_the_whole_city_to_jev(index: TownIndex) -> None:
+    """誤字・異体字は、その市区町村の町字を全部 Jev に渡す。
 
-    以前は編集距離で拾おうとしていたが、実測で再現率 44% に対して全件の
-    レイテンシが 25 倍になったため止めた。詳細は candidates.py の docstring。
+    編集距離で順位づけするのではなく、絞り込みを諦めて判断を委ねる。
+    異体字の同定は Jev の得意分野で、こちらが距離で順位をつける筋合いがない。
     """
     found = _finder(index).find(normalize("鳥取県鳥取市面かげ1丁目1-2"))
+    assert not found.exact
+    assert found.city_id is not None
+    displays = _displays(index, normalize("鳥取県鳥取市面かげ1丁目1-2"))
+    assert "鳥取県鳥取市面影一丁目" in displays  # 正解が候補に入っている
+    assert "鳥取県鳥取市叶" in displays  # 同じ市の町字は全部入る
+    # 町字の切れ目は「市区町村より後ろの最初の数字」で決める。
+    assert all(c.remainder == "1丁目1-2" for c in found.candidates)
+
+
+def test_city_wide_gives_up_when_the_city_has_too_many_towns(index: TownIndex) -> None:
+    """255 件に収まらない市区町村では、何を落とすかの判断が要るので手を出さない。"""
+    from jev_abr_geocoder.config import GeocoderConfig
+
+    cfg = GeocoderConfig(max_options=3)  # 候補は 2 件まで
+    found = CandidateFinder(index, cfg).find(normalize("鳥取県鳥取市面かげ1丁目1-2"))
     assert found.candidates == []
-    assert found.city_id is not None  # 市区町村までは分かる
-    assert found.exhausted is None  # 入力はまだ続いていた
+    assert found.city_id is not None
 
 
 def test_input_ending_at_city_yields_no_town_candidates(index: TownIndex) -> None:

@@ -70,7 +70,10 @@ CREATE TABLE IF NOT EXISTS town(
     lat_1e7       INTEGER,
     lon_1e7       INTEGER
 );
-CREATE INDEX IF NOT EXISTS town_by_machiaza ON town(lg_code, machiaza_id);
+-- 同じ町字を 2 行に分けない。mt_town は住居表示と地番の両方を持つ町字を
+-- rsdt_addr_flg 違いの 2 行で収録しているが、取り込み時に 1 行へまとめる。
+-- 分かれていると表示が同一の選択肢を Jev に見せることになり、答えようがない。
+CREATE UNIQUE INDEX IF NOT EXISTS town_by_machiaza ON town(lg_code, machiaza_id);
 
 -- 街区・住居番号・地番。町字単位でパックした BLOB（numblob.py の形式）。
 CREATE TABLE IF NOT EXISTS num_blob(
@@ -184,7 +187,7 @@ class Store:
         self._conn.execute("DELETE FROM city")
         self._conn.executemany("INSERT INTO city VALUES(?, ?, ?, ?, ?, ?, ?, ?)", rows)
 
-    def replace_towns(self, rows: Iterable[tuple[Any, ...]]) -> None:
+    def replace_towns(self, rows: Iterable[Sequence[Any]]) -> None:
         self._conn.execute("DELETE FROM town")
         self._conn.executemany(
             "INSERT INTO town VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
