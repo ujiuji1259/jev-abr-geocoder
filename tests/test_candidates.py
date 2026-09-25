@@ -6,7 +6,7 @@
 
 from jev_abr_geocoder.config import GeocoderConfig
 from jev_abr_geocoder.index.townindex import TownIndex
-from jev_abr_geocoder.match.candidates import CandidateFinder, prefix_distance
+from jev_abr_geocoder.match.candidates import CandidateFinder
 from jev_abr_geocoder.models import Level
 from jev_abr_geocoder.textnorm import normalize
 
@@ -19,13 +19,6 @@ def _displays(index: TownIndex, normalized: str) -> list[str]:
     found = _finder(index).find(normalized)
     records = index.store.towns([c.town_id for c in found.candidates])
     return [records[c.town_id].display for c in found.candidates]
-
-
-def test_prefix_distance_allows_the_text_to_continue() -> None:
-    # 末尾に番地が続いていても、前方一致としては距離 0。
-    assert prefix_distance("鳥取県鳥取市面影一丁目", "鳥取県鳥取市面影一丁目1-2", 2) == 0
-    assert prefix_distance("面影", "面かげ", 2) == 1
-    assert prefix_distance("まったく違う", "鳥取県", 2) == 3  # 打ち切り値
 
 
 def test_exact_prefix_match(index: TownIndex) -> None:
@@ -48,16 +41,16 @@ def test_alias_lets_county_be_omitted(index: TownIndex) -> None:
     assert "長崎県北松浦郡佐々町石木場免" in _displays(index, normalize("佐々町石木場免1-1"))
 
 
-def test_typo_falls_back_and_still_recalls_the_answer(index: TownIndex) -> None:
-    """前方一致が取れない誤字でも、正解が候補に残ること。
+def test_typo_gives_up_at_city_level(index: TownIndex) -> None:
+    """誤字は町字を諦めて市区町村で返す。
 
-    1 位である必要はない。絞り込むのがトライ、選ぶのが Jev。
+    以前は編集距離で拾おうとしていたが、実測で再現率 44% に対して全件の
+    レイテンシが 25 倍になったため止めた。詳細は candidates.py の docstring。
     """
     found = _finder(index).find(normalize("鳥取県鳥取市面かげ1丁目1-2"))
-    assert not found.exact
-    records = index.store.towns([c.town_id for c in found.candidates])
-    displays = [records[c.town_id].display for c in found.candidates]
-    assert "鳥取県鳥取市面影一丁目" in displays
+    assert found.candidates == []
+    assert found.city_id is not None  # 市区町村までは分かる
+    assert found.exhausted is None  # 入力はまだ続いていた
 
 
 def test_input_ending_at_city_yields_no_town_candidates(index: TownIndex) -> None:
@@ -107,9 +100,15 @@ def test_unambiguous_gives_up_when_same_length_matches_collide(index: TownIndex)
     assert found.unambiguous() is None
 
 
-def test_unambiguous_gives_up_on_fuzzy_matches(index: TownIndex) -> None:
-    found = _finder(index).find(normalize("鳥取県鳥取市面かげ1丁目1-2"))
+def test_unambiguous_gives_up_when_input_is_a_key_prefix(index: TownIndex) -> None:
+    """入力が言いかけのときは、どの町字かを決められないので Jev に委ねる。
+
+    自由が丘は ABR に丁目なしの行が無いので、「自由が丘」だけでは
+    索引鍵の先頭一致にしかならない。
+    """
+    found = _finder(index).find(normalize("東京都目黒区自由が丘"))
     assert not found.exact
+    assert found.candidates
     assert found.unambiguous() is None
 
 
@@ -118,3 +117,28 @@ def test_kanji_chome_matches_arabic_source(index: TownIndex) -> None:
     assert "東京都目黒区自由が丘２丁目" in _displays(
         index, normalize("東京都目黒区自由が丘二丁目17-6")
     )
+
+
+def test_input_that_is_a_prefix_of_index_keys(index: TownIndex) -> None:
+    """「面影」だけでは ABR に行が無いが、索引鍵の側がこの入力で始まっている。
+
+    丁目を持つ大字のうち、丁目なしの親エントリも在るのは全国で 19% だけ。
+    残り 81% はこの経路でしか拾えない。
+    """
+    found = _finder(index).find(normalize("東京都目黒区自由が丘"))
+    assert "東京都目黒区自由が丘２丁目" in _displays(index, normalize("東京都目黒区自由が丘"))
+    assert all(c.remainder == "" for c in found.candidates)
+
+
+def test_trailing_number_is_stripped_before_the_prefix_lookup(index: TownIndex) -> None:
+    """番地が付いていても、削ってから索引鍵の先頭一致を試す。"""
+    found = _finder(index).find(normalize("鳥取県鳥取市大字福井字上町"))
+    # 大字福井 に小字は無いので、福井そのものが前方一致する
+    assert found.exact or found.candidates
+
+
+def test_unknown_city_yields_pref_only(index: TownIndex) -> None:
+    found = _finder(index).find(normalize("鳥取県そんな市は無い町1-2"))
+    assert found.candidates == []
+    assert found.pref_lg_code is not None
+    assert found.city_id is None

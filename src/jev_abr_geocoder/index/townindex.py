@@ -153,28 +153,11 @@ class TownIndex:
                 best = (pref, key)
         return best
 
-    def towns_under(self, prefix: str, limit: int) -> list[TownHit]:
-        """``prefix`` 配下の町字鍵を返す。前方一致が取れなかったときの母集合。
-
-        同じ町字が複数のエイリアスで現れるので、``town_id`` で重複を除く。
-        """
-        seen: set[int] = set()
-        out: list[TownHit] = []
-        for key, payload in self._trie.items(prefix):
-            town_id = int(payload[0])
-            if town_id in seen:
-                continue
-            seen.add(town_id)
-            out.append(TownHit(town_id=town_id, key=key))
-            if len(out) >= limit:
-                break
-        return out
-
     def keys_under(self, prefix: str, limit: int) -> list[tuple[str, int]]:
-        """``prefix`` 配下の (鍵, town_id)。編集距離スキャンの母集合。
+        """``prefix`` で始まる索引鍵と、その町字。
 
-        :meth:`towns_under` と違い、同じ町字の別表記も残す。入力がどの表記に
-        近いか分からないため、全表記を突き合わせる必要がある。
+        入力が索引鍵の先頭になっているケース（丁目や小字の省略）を拾うための
+        完全一致の探索で、曖昧一致ではない。
         """
         out: list[tuple[str, int]] = []
         for key, payload in self._trie.items(prefix):

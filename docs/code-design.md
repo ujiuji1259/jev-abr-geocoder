@@ -50,7 +50,7 @@ src/jev_abr_geocoder/
 │   └── build.py         構築オーケストレーション（再開可能）
 │
 ├── match/               候補生成と判定
-│   ├── candidates.py    層1 の候補生成（前方一致 → フォールバック）
+│   ├── candidates.py    層1 の候補生成（完全一致 2 方向。曖昧一致なし）
 │   ├── tail.py          数値テール抽出
 │   └── rerank.py        Jev 呼び出し（Choice、該当なしは予約オプション）
 │
@@ -182,11 +182,14 @@ class CandidateFinder:
         """
 ```
 
-探索の順序:
+探索の順序（**すべて完全一致。曖昧一致はしない**）:
 
-1. `index.prefixes(normalized)` — 5.3 µs。一致鍵をすべて取る
-2. 0 件なら**段階的に短くしてフォールバック**する。都道府県+市区町村の前方一致を探し、`index.keys_under(city_prefix)` でその配下だけ取り出して編集距離スキャン
-3. 市区町村すら当たらなければ、1,918 件の市区町村全体に編集距離スキャン（数ミリ秒）
+1. `index.prefixes(normalized)` — 索引鍵が入力の先頭。5.3 µs。99.6% はここで決まる
+2. 入力が市区町村・都道府県ちょうどで終わっていないか
+3. `index.keys_under(stem)` — 入力が索引鍵の先頭（丁目・小字の省略）。末尾の番地を削ってからも試す
+4. どれも当たらなければ市区町村の粒度で返す
+
+**編集距離は持たない。** 実測で再現率 44%、全件のレイテンシ 25 倍、候補集合にノイズ、と割に合わなかった（[architecture.md](architecture.md) 参照）。
 
 **`score` は順位付け専用。** 255 件に収まらないときにどれを落とすかを決めるためだけに使う。「スコアがこの値以上なら採用」という判断は書かない — それをやり始めると閾値調整が始まり、原則1 が崩れる。
 
@@ -347,12 +350,10 @@ class GeocoderConfig:
     # --- 閾値 ---
     town_confidence: float = 0.70
     number_confidence: float = 0.60
-    contains_answer: float = 0.50
+    present_threshold: float = 0.50 # __none__ 以外の確率の合計の下限
 
     # --- 候補生成 ---
     max_options: int = 255          # Jev Choice のオプション上限
-    fallback_limit: int = 60        # 編集距離スキャンで返す上限
-    max_edit_distance: int = 2
 
     # --- 挙動 ---
     always_rerank: bool = False     # ファストパスを無効化（評価用）
