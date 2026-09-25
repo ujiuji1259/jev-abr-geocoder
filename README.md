@@ -4,7 +4,13 @@
 
 ABR をトライ木として持って前方一致で候補を絞り、候補を [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) (TypeSafe の System One モデル) の Choice に渡して最も近い住所を選ばせる。
 
-設計は [docs/architecture.md](docs/architecture.md) を参照。
+## ドキュメント
+
+| | |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | データ構成と容量・性能の実測に基づく設計判断 |
+| [docs/code-design.md](docs/code-design.md) | モジュール分割・型・インターフェース |
+| [docs/eval.md](docs/eval.md) | 評価セットと指標、閾値の決め方 |
 
 ## 状態
 
