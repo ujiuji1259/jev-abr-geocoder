@@ -27,7 +27,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from ..address import Granularity, MachiazaRecord
@@ -84,7 +84,7 @@ class MachiazaCandidate:
 
 @dataclass(frozen=True, slots=True)
 class CandidateSet:
-    candidates: list[MachiazaCandidate]
+    candidates: tuple[MachiazaCandidate, ...]
     #: 索引鍵が入力の先頭として一致したか。診断用。
     prefix_matched: bool
     #: 市区町村までは特定できた場合、その lg_code
@@ -98,13 +98,13 @@ class CandidateSet:
     #: このとき candidates は上限を超えた件数を持つので、そのままでは渡せない。
     needs_narrowing: bool = False
 
-    def narrowed(self, candidates: list[MachiazaCandidate]) -> CandidateSet:
+    def narrowed(self, candidates: Sequence[MachiazaCandidate]) -> CandidateSet:
         """絞り込んだ候補で置き換える。
 
         分割絞り込み の結果を受ける口。絞り終わっているので
         ``needs_narrowing`` は下りる。空を渡せば「候補なし」になり、粒度が落ちる。
         """
-        return replace(self, candidates=candidates, needs_narrowing=False)
+        return replace(self, candidates=tuple(candidates), needs_narrowing=False)
 
     def unambiguous(self) -> MachiazaCandidate | None:
         """選ぶ余地が無い候補があればそれを返す。
@@ -132,7 +132,7 @@ class CandidateFinder:
     def find(self, normalized: str) -> CandidateSet:
         """正規化済み入力から町字候補を出す。"""
         if not normalized:
-            return CandidateSet(candidates=[], prefix_matched=False)
+            return CandidateSet(candidates=(), prefix_matched=False)
         # 候補が空でも意味のある結果（市区町村で確定など）を返す段があるので、
         # 真偽値ではなく None かどうかで分岐する。
         for step in (self._forward, self._boundary, self._extensions, self._city_wide):
@@ -165,7 +165,9 @@ class CandidateFinder:
                 break
         city = self._index.city_prefixes(normalized)
         return CandidateSet(
-            candidates=out, prefix_matched=True, city_lg_code=city[0].lg_code if city else None
+            candidates=tuple(out),
+            prefix_matched=True,
+            city_lg_code=city[0].lg_code if city else None,
         )
 
     # ------------------------------ ② 入力がちょうど市区町村・都道府県で終わる
@@ -180,7 +182,7 @@ class CandidateFinder:
         city_hits = self._index.city_prefixes(normalized)
         if city_hits and city_hits[0].matched_len >= len(normalized):
             return CandidateSet(
-                candidates=[],
+                candidates=(),
                 prefix_matched=True,
                 city_lg_code=city_hits[0].lg_code,
                 ends_at=Granularity.CITY,
@@ -188,7 +190,7 @@ class CandidateFinder:
         pref_hit = self._index.pref_prefix(normalized)
         if pref_hit is not None and len(pref_hit[1]) >= len(normalized):
             return CandidateSet(
-                candidates=[],
+                candidates=(),
                 prefix_matched=True,
                 pref_lg_code=pref_hit[0].lg_code,
                 ends_at=Granularity.PREF,
@@ -231,7 +233,9 @@ class CandidateFinder:
                     break
             city = self._index.city_prefixes(normalized)
             return CandidateSet(
-                candidates=out, prefix_matched=False, city_lg_code=city[0].lg_code if city else None
+                candidates=tuple(out),
+                prefix_matched=False,
+                city_lg_code=city[0].lg_code if city else None,
             )
         return None
 
@@ -279,7 +283,7 @@ class CandidateFinder:
             for row_id in seen
         ]
         return CandidateSet(
-            candidates=candidates,
+            candidates=tuple(candidates),
             prefix_matched=False,
             city_lg_code=best.lg_code,
             needs_narrowing=len(candidates) > limit,
@@ -299,27 +303,27 @@ class CandidateFinder:
             best = city_hits[0]
             ends_at = Granularity.CITY if best.matched_len >= len(normalized) else None
             return CandidateSet(
-                candidates=[], prefix_matched=False, city_lg_code=best.lg_code, ends_at=ends_at
+                candidates=(), prefix_matched=False, city_lg_code=best.lg_code, ends_at=ends_at
             )
 
         pref_hit = self._index.pref_prefix(normalized)
         if pref_hit is not None:
             ends_at = Granularity.PREF if len(pref_hit[1]) >= len(normalized) else None
             return CandidateSet(
-                candidates=[],
+                candidates=(),
                 prefix_matched=False,
                 pref_lg_code=pref_hit[0].lg_code,
                 ends_at=ends_at,
             )
-        return CandidateSet(candidates=[], prefix_matched=False)
+        return CandidateSet(candidates=(), prefix_matched=False)
 
 
 # ------------------------------------------------- 候補のまとめ方
 
 
 def group_by_display(
-    candidates: Sequence[MachiazaCandidate], records: dict[int, MachiazaRecord]
-) -> list[list[MachiazaCandidate]]:
+    candidates: Sequence[MachiazaCandidate], records: Mapping[int, MachiazaRecord]
+) -> tuple[tuple[MachiazaCandidate, ...], ...]:
     """表示住所ごとにまとめる。出現順を保つ。
 
     **表示が同じ候補を判定モデルに重ねて見せない。** 京都市中京区には同名の
@@ -331,8 +335,8 @@ def group_by_display(
 
 
 def group_by_oaza(
-    candidates: Sequence[MachiazaCandidate], records: dict[int, MachiazaRecord]
-) -> list[list[MachiazaCandidate]]:
+    candidates: Sequence[MachiazaCandidate], records: Mapping[int, MachiazaRecord]
+) -> tuple[tuple[MachiazaCandidate, ...], ...]:
     """大字ごとにまとめる。出現順を保つ。
 
     候補が上限を超えた市区町村で、先に大字だけを選ばせるときの単位。
@@ -343,9 +347,9 @@ def group_by_oaza(
 def _group(
     candidates: Sequence[MachiazaCandidate],
     key: Callable[[MachiazaRecord], str],
-    records: dict[int, MachiazaRecord],
-) -> list[list[MachiazaCandidate]]:
+    records: Mapping[int, MachiazaRecord],
+) -> tuple[tuple[MachiazaCandidate, ...], ...]:
     groups: dict[str, list[MachiazaCandidate]] = {}
     for candidate in candidates:
         groups.setdefault(key(records[candidate.row_id]), []).append(candidate)
-    return list(groups.values())
+    return tuple(tuple(group) for group in groups.values())

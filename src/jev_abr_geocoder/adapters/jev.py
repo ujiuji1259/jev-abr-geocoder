@@ -44,7 +44,7 @@ class JevModel:
 
     async def choose(self, questions: Sequence[ports.Question]) -> ports.Answers:
         if not questions:
-            return ports.Answers(decisions=[], usage=Usage())
+            return ports.Answers(decisions=(), usage=Usage())
 
         state, payload = _build(questions)
         try:
@@ -55,11 +55,11 @@ class JevModel:
         except Exception as exc:  # noqa: BLE001 - ベンダの例外をポートの語彙に直す
             raise ports.ModelUnavailable(str(exc)) from exc
 
-        usage = Usage()
-        usage.add(*_tokens(response))
+        input_tokens, output_tokens = _tokens(response)
         return ports.Answers(
-            decisions=[_decision(answers.get(_question_id(i))) for i in range(len(questions))],
-            usage=usage,
+            decisions=tuple(_decision(answers.get(_question_id(i))) for i in range(len(questions))),
+            # choose() 1 回が 1 リクエスト。
+            usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens, requests=1),
         )
 
 

@@ -27,15 +27,15 @@ class BanchiCandidates:
     住居表示の町字でも街区や地番しか無いことがあるため、両者は一致しない。
     """
 
-    entries: list[Banchi]
+    entries: tuple[Banchi, ...]
     kind: BanchiKind
 
     def __bool__(self) -> bool:
         return bool(self.entries)
 
-    def narrowed(self, entries: list[Banchi]) -> BanchiCandidates:
+    def narrowed(self, entries: Sequence[Banchi]) -> BanchiCandidates:
         """候補を絞った同じ体系の候補集合。"""
-        return BanchiCandidates(entries=entries, kind=self.kind)
+        return BanchiCandidates(entries=tuple(entries), kind=self.kind)
 
 
 def candidates_for(
@@ -49,7 +49,7 @@ def candidates_for(
     合うものが出たところで止める。
     """
     kind = machiaza.banchi_kind
-    best = BanchiCandidates(entries=[], kind=kind)
+    best = BanchiCandidates(entries=(), kind=kind)
     for machiaza_id in machiaza.machiaza_ids:
         found = _for_machiaza(store, machiaza.lg_code, machiaza_id, kind, tail)
         if _has_exact(found.entries, tail.numbers):
@@ -64,26 +64,26 @@ def _for_machiaza(
 ) -> BanchiCandidates:
     entries = store.fetch_banchi(lg_code, machiaza_id, kind, num1=tail.first)
     if kind is not BanchiKind.RSDT or _has_exact(entries, tail.numbers):
-        return BanchiCandidates(entries=entries, kind=kind)
+        return BanchiCandidates(entries=tuple(entries), kind=kind)
     # 住居表示実施区域でも街区までしか無い町字、住居表示と地番の両方を持つ
     # 町字（全国 1,248 件）、そして「街区だけ入力されて住居番号が無い」場合が
     # あるので順に落とす。
     for fallback in (BanchiKind.BLOCK, BanchiKind.PARCEL):
         alternative = store.fetch_banchi(lg_code, machiaza_id, fallback, num1=tail.first)
         if _has_exact(alternative, tail.numbers):
-            return BanchiCandidates(entries=alternative, kind=fallback)
+            return BanchiCandidates(entries=tuple(alternative), kind=fallback)
         if not entries and alternative:
             entries, kind = alternative, fallback
-    return BanchiCandidates(entries=entries, kind=kind)
+    return BanchiCandidates(entries=tuple(entries), kind=kind)
 
 
-def exact(options: BanchiCandidates, numbers: Sequence[int]) -> list[Banchi]:
+def exact(options: BanchiCandidates, numbers: Sequence[int]) -> tuple[Banchi, ...]:
     """入力の数値列と完全に一致する候補。"""
     target = tuple(numbers)
-    return [e for e in options.entries if e.numbers == target]
+    return tuple(e for e in options.entries if e.numbers == target)
 
 
-def parents(options: BanchiCandidates, numbers: Sequence[int]) -> list[Banchi]:
+def parents(options: BanchiCandidates, numbers: Sequence[int]) -> tuple[Banchi, ...]:
     """入力の番号列を先頭に持つ候補。入力が親番までのときに使う。
 
     「中砂見936番地」(936,) に対して 936-1 / 936-2 / 936-3 が返る。番号の
@@ -92,10 +92,10 @@ def parents(options: BanchiCandidates, numbers: Sequence[int]) -> list[Banchi]:
     """
     target = tuple(numbers)
     if not target:
-        return []
-    return [
+        return ()
+    return tuple(
         e for e in options.entries if e.numbers[: len(target)] == target and e.numbers != target
-    ]
+    )
 
 
 def ranked(options: BanchiCandidates, numbers: Sequence[int], limit: int) -> BanchiCandidates:

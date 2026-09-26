@@ -263,7 +263,7 @@ class Question:
 @dataclass(frozen=True, slots=True)
 class Answers:
     #: 渡した問と同じ順・同じ長さ。答えが得られなかった問は ``index=None``。
-    decisions: Sequence[Decision]
+    decisions: tuple[Decision, ...]
     usage: Usage
 
 

@@ -5,27 +5,31 @@
 
 **確信が持てないときも結果を捨てず、粒度を 1 段上げて返す**のがこの層の仕事。
 
-====================  ==========================================
+====================  ==============================================
 確信が持てないもの      返すもの
-====================  ==========================================
-番号                   町字の代表点、``level=MACHIAZA``
-町字                   市区町村の代表点、``level=CITY``
-市区町村               都道府県の代表点、``level=PREF``
-何も当たらない          ``level=UNKNOWN``
-====================  ==========================================
+====================  ==============================================
+番号                   町字の代表点、``granularity=MACHIAZA``
+町字                   市区町村の代表点、``granularity=CITY``
+市区町村               都道府県の代表点、``granularity=PREF``
+何も当たらない          ``granularity=UNKNOWN``
+====================  ==============================================
 
-``resolved`` は「要求された粒度まで確信を持って解決できたか」、``level`` は
+``resolved`` は「要求された粒度まで確信を持って解決できたか」、``granularity`` は
 「実際にどこまで解決したか」を表す。この 2 つを分けてあるので、呼び出し側が
 「町字まででよい」用途にそのまま使える（docs/code-design.md §7）。
+
+**値はすべて frozen。** 組み立ては ``dataclasses.replace`` で「決まったところまで
+入った写し」を作りながら進める。書き込む順で結果が変わらないので、どの粒度で
+返したのかが関数の戻り値だけで追える。
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from .address import Banchi, BanchiKind, CityRecord, Granularity, MachiazaName, MachiazaRecord
+from .address import Banchi, BanchiKind, CityRecord, Granularity, MachiazaRecord
 from .config import GeocoderConfig
 from .decision import Decision
 from .index.machiaza_index import MachiazaIndex
@@ -37,9 +41,13 @@ from .outcome import GeocodeResult
 __all__ = ["Resolution", "build"]
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Resolution:
-    """1 件分の解決状態。段を追って埋まり、最後に結果へ変換される。"""
+    """1 件分の解決状態。
+
+    段は書き換えずに :meth:`dataclasses.replace` で写しを作って返す。**途中状態を
+    共有して書き換えないので、どの段が何を決めたのかが戻り値に出る。**
+    """
 
     query: str
     normalized: str
@@ -54,14 +62,15 @@ class Resolution:
     #: 解決できなかった理由。
     note: str = ""
 
-    def remember(self, note: str) -> None:
-        """理由を残す。**後段の理由で上書きしない。**
+    def noted(self, note: str) -> Resolution:
+        """理由を付けた写しを返す。**後段の理由で上書きしない。**
 
         判定モデルが落ちた等の根本的な理由が先に入るので、そちらを残すほうが
         役に立つ。「確信度が低い」はその結果にすぎない。空文字は無視する。
         """
-        if note and not self.note:
-            self.note = note
+        if self.note or not note:
+            return self
+        return replace(self, note=note)
 
     def machiaza_is_confident(self, cfg: GeocoderConfig) -> bool:
         """町字を確定したと見なせるか。番号を引きに行くかもこれで決まる。"""
@@ -78,135 +87,168 @@ class Resolution:
 
 def build(item: Resolution, index: MachiazaIndex, cfg: GeocoderConfig) -> GeocodeResult:
     """解決状態を結果にする。"""
-    result = GeocodeResult(query=item.query, normalized=item.normalized)
-    _fill(result, item, index, cfg)
-    # 理由は段の側でも溜まるので、最後にまとめて移す。
-    result.note = item.note
-    return result
-
-
-def _fill(
-    result: GeocodeResult, item: Resolution, index: MachiazaIndex, cfg: GeocoderConfig
-) -> None:
+    # 段の側で溜まった理由を種にする。以降は結果の側に積む。
+    result = GeocodeResult(query=item.query, normalized=item.normalized, note=item.note)
     machiaza = item.machiaza
+
     if machiaza is None:
-        _fill_coarse(result, item, index)
-        return
+        return _coarse(result, item, index)
 
     if not item.machiaza_is_confident(cfg):
-        _fill_city(result, machiaza, index.city(machiaza.lg_code))
-        if item.machiaza_decision is not None:
-            item.remember(
-                _low_confidence_note("町字", item.machiaza_decision, machiaza.name.display)
-            )
-        return
+        result = _at_city(result, machiaza, index.city(machiaza.lg_code))
+        if item.machiaza_decision is None:
+            return result
+        return _noted(
+            result, _low_confidence_note("町字", item.machiaza_decision, machiaza.name.display)
+        )
 
+    return _with_banchi(_at_machiaza(result, item, machiaza, index), item, cfg)
+
+
+# ------------------------------------------------------------------ 各粒度
+
+
+def _at_machiaza(
+    result: GeocodeResult, item: Resolution, machiaza: MachiazaRecord, index: MachiazaIndex
+) -> GeocodeResult:
+    name = machiaza.name
     city = index.city(machiaza.lg_code)
-    _fill_city_columns(result, machiaza.name)
-    result.machiaza = machiaza.name.machiaza
-    result.lg_code = machiaza.lg_code_str
-    result.machiaza_id = machiaza.machiaza_code
-    result.point = machiaza.point or (city.point if city else None)
-    result.granularity = Granularity.MACHIAZA
-    result.resolved = True
-    result.confidence = item.machiaza_decision.confidence if item.machiaza_decision else 0.0
-    result.probability = item.machiaza_decision.probability if item.machiaza_decision else 0.0
-    result.remainder = item.tail.raw if item.tail else ""
+    decision = item.machiaza_decision
+    return replace(
+        result,
+        pref=name.pref,
+        county=name.county,
+        city=name.city,
+        ward=name.ward,
+        machiaza=name.machiaza,
+        lg_code=machiaza.lg_code_str,
+        machiaza_id=machiaza.machiaza_code,
+        point=machiaza.point or (city.point if city else None),
+        granularity=Granularity.MACHIAZA,
+        resolved=True,
+        confidence=decision.confidence if decision else 0.0,
+        probability=decision.probability if decision else 0.0,
+        remainder=item.tail.raw if item.tail else "",
+    )
 
-    _fill_banchi(result, item, cfg)
+
+def _at_city(
+    result: GeocodeResult, machiaza: MachiazaRecord, city: CityRecord | None
+) -> GeocodeResult:
+    """町字までは絞れたが確信が持てない。市区町村として返す。"""
+    name = machiaza.name
+    return replace(
+        result,
+        pref=name.pref,
+        county=name.county,
+        city=name.city,
+        ward=name.ward,
+        lg_code=machiaza.lg_code_str,
+        point=city.point if city else machiaza.point,
+        granularity=Granularity.CITY,
+        resolved=False,
+    )
 
 
-def _fill_banchi(result: GeocodeResult, item: Resolution, cfg: GeocoderConfig) -> None:
+def _with_banchi(result: GeocodeResult, item: Resolution, cfg: GeocoderConfig) -> GeocodeResult:
     decision = item.banchi_decision
     options = item.banchi
     if decision is None or options is None or not options:
-        return
+        return result
     if decision.index is None or not 0 <= decision.index < len(options.entries):
         if decision.contains_answer and decision.contains_answer < cfg.present_threshold:
-            item.remember("番号が候補に見つからない")
-        return
+            return _noted(result, "番号が候補に見つからない")
+        return result
+
     entry = options.entries[decision.index]
     if not decision.fast_path and decision.confidence < cfg.banchi_confidence:
-        item.remember(_low_confidence_note("番号", decision, entry.display))
-        return
+        return _noted(result, _low_confidence_note("番号", decision, entry.display))
 
     numbers = item.tail.numbers if (item.banchi_parent and item.tail) else entry.numbers
-    result.banchi = _format_banchi(options.kind, numbers)
-    result.granularity = _granularity_for(options.kind, numbers)
-    result.confidence = decision.confidence
-    result.probability = decision.probability
-    if entry.point is not None:
-        result.point = entry.point
+    result = replace(
+        result,
+        banchi=_format_banchi(options.kind, numbers),
+        granularity=_granularity_for(options.kind, numbers),
+        confidence=decision.confidence,
+        probability=decision.probability,
+        point=entry.point or result.point,
+        remainder=_remainder_after_banchi(item.tail.raw if item.tail else "", entry),
+    )
+
     if item.banchi_parent:
         # 枝番は入力に無いので ABR の ID は付けない。座標は代表のもの。
-        item.remember(f"枝番は入力に含まれない。{len(options.entries)} 件のうち代表の座標")
-    elif options.kind is BanchiKind.PARCEL:
-        result.prc_id = entry.prc_id()
-    else:
-        result.blk_id = entry.blk_id()
-        if options.kind is BanchiKind.RSDT:
-            result.rsdt_id = entry.rsdt_id()
-            result.rsdt2_id = entry.rsdt2_id()
-    result.remainder = _remainder_after_banchi(item.tail.raw if item.tail else "", entry)
+        return _noted(result, f"枝番は入力に含まれない。{len(options.entries)} 件のうち代表の座標")
+    if options.kind is BanchiKind.PARCEL:
+        return replace(result, prc_id=entry.prc_id())
+    if options.kind is BanchiKind.RSDT:
+        return replace(
+            result,
+            blk_id=entry.blk_id(),
+            rsdt_id=entry.rsdt_id(),
+            rsdt2_id=entry.rsdt2_id(),
+        )
+    return replace(result, blk_id=entry.blk_id())
 
 
-def _fill_coarse(result: GeocodeResult, item: Resolution, index: MachiazaIndex) -> None:
+def _coarse(result: GeocodeResult, item: Resolution, index: MachiazaIndex) -> GeocodeResult:
     """町字が決まらなかったとき、分かるところまでを返す。"""
-    lg_code = item.candidates.city_lg_code
-    if lg_code is not None:
-        city = index.city(lg_code)
+    city_lg_code = item.candidates.city_lg_code
+    if city_lg_code is not None:
+        city = index.city(city_lg_code)
         if city is not None:
-            result.pref = city.pref
-            result.county = city.county
-            result.city = city.city
-            result.ward = city.ward
-            result.lg_code = f"{city.lg_code:06d}"
-            result.point = city.point
-            result.granularity = Granularity.CITY
-            _mark_ends_here(result, item, Granularity.CITY, "町字")
-            return
+            return _ends_here(
+                replace(
+                    result,
+                    pref=city.pref,
+                    county=city.county,
+                    city=city.city,
+                    ward=city.ward,
+                    lg_code=f"{city.lg_code:06d}",
+                    point=city.point,
+                    granularity=Granularity.CITY,
+                ),
+                item,
+                Granularity.CITY,
+                "町字",
+            )
 
     pref_lg_code = item.candidates.pref_lg_code
     if pref_lg_code is not None:
         pref = index.pref(pref_lg_code)
         if pref is not None:
-            result.pref = pref.pref
-            result.lg_code = f"{pref.lg_code:06d}"
-            result.point = pref.point
-            result.granularity = Granularity.PREF
-            _mark_ends_here(result, item, Granularity.PREF, "市区町村")
-            return
+            return _ends_here(
+                replace(
+                    result,
+                    pref=pref.pref,
+                    lg_code=f"{pref.lg_code:06d}",
+                    point=pref.point,
+                    granularity=Granularity.PREF,
+                ),
+                item,
+                Granularity.PREF,
+                "市区町村",
+            )
 
-    result.granularity = Granularity.UNKNOWN
-    item.remember("候補が見つからない")
-
-
-def _fill_city(result: GeocodeResult, machiaza: MachiazaRecord, city: CityRecord | None) -> None:
-    """町字までは絞れたが確信が持てない。市区町村として返す。"""
-    _fill_city_columns(result, machiaza.name)
-    result.lg_code = machiaza.lg_code_str
-    result.point = city.point if city else machiaza.point
-    result.granularity = Granularity.CITY
-    result.resolved = False
+    return _noted(replace(result, granularity=Granularity.UNKNOWN), "候補が見つからない")
 
 
-def _fill_city_columns(result: GeocodeResult, name: MachiazaName) -> None:
-    result.pref = name.pref
-    result.county = name.county
-    result.city = name.city
-    result.ward = name.ward
-
-
-def _mark_ends_here(
+def _ends_here(
     result: GeocodeResult, item: Resolution, granularity: Granularity, missing: str
-) -> None:
+) -> GeocodeResult:
     """入力がこの粒度で尽きていたなら解決済みとし、そうでなければ理由を残す。"""
     if item.candidates.ends_at is granularity:
-        result.resolved = True
-        result.confidence = 1.0
-        result.probability = 1.0
-    else:
-        item.remember(f"{missing}を特定できない")
+        return replace(result, resolved=True, confidence=1.0, probability=1.0)
+    return _noted(result, f"{missing}を特定できない")
+
+
+# -------------------------------------------------------------------- 表記
+
+
+def _noted(result: GeocodeResult, note: str) -> GeocodeResult:
+    """理由を付けた写しを返す。最初に付いたものを残す。"""
+    if result.note or not note:
+        return result
+    return replace(result, note=note)
 
 
 def _low_confidence_note(what: str, decision: Decision, guess: str) -> str:

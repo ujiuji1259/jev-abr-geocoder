@@ -158,6 +158,6 @@ async def test_no_questions_costs_nothing() -> None:
     client = _FakeClient()
     model = JevModel(client, "jev-latest", 30.0)
     result = await model.choose([])
-    assert result.decisions == []
+    assert result.decisions == ()
     assert result.usage.requests == 0
     assert not client.calls

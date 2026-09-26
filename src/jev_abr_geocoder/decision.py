@@ -2,6 +2,8 @@
 
 :mod:`ports` の :class:`DecisionModel` が返す値型。**閾値との比較はここでは
 しない** — 採否は ``assemble`` が ``config`` の閾値を見て決める。
+
+どちらも frozen。使用量は段ごとに出るので、``+`` で畳めるようにしてある。
 """
 
 from __future__ import annotations
@@ -41,19 +43,21 @@ class Decision:
         return cls(index=None, probability=0.0, confidence=0.0, contains_answer=0.0)
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Usage:
+    """判定モデルの使用量。**足し算で畳む。**
+
+    >>> Usage(100, 10, 1) + Usage(50, 5, 1)
+    Usage(input_tokens=150, output_tokens=15, requests=2)
+    """
+
     input_tokens: int = 0
     output_tokens: int = 0
     requests: int = 0
 
-    def add(self, input_tokens: int, output_tokens: int) -> None:
-        """1 リクエスト分を足す。"""
-        self.input_tokens += input_tokens
-        self.output_tokens += output_tokens
-        self.requests += 1
-
-    def merge(self, other: Usage) -> None:
-        self.input_tokens += other.input_tokens
-        self.output_tokens += other.output_tokens
-        self.requests += other.requests
+    def __add__(self, other: Usage) -> Usage:
+        return Usage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            requests=self.requests + other.requests,
+        )

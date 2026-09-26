@@ -1,13 +1,16 @@
 """出力の値型。
 
 ``geocode_many`` が返すもの。:class:`GeocodeResult` は 1 件分、
-:class:`BatchOutcome` はそれとバッチ全体の実行統計。段を追って埋まるので
-**この 2 つだけは可変**。
+:class:`BatchOutcome` はそれとバッチ全体の実行統計。
+
+**どちらも frozen。** 結果を受け取った側が書き換えられないので、キャッシュに
+入れても複数のワーカーに渡しても安全。組み立ての途中は :mod:`assemble` が
+``dataclasses.replace`` で新しい値を作りながら進める（docs/code-design.md 制約5）。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from .address import Granularity, Point
@@ -16,7 +19,7 @@ from .decision import Usage
 __all__ = ["GeocodeResult", "BatchOutcome"]
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class GeocodeResult:
     """1 件の正規化結果。
 
@@ -91,23 +94,28 @@ class GeocodeResult:
         }
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class BatchOutcome:
-    """:meth:`Geocoder.geocode_many` の結果と、そのバッチの実行統計。"""
+    """:meth:`Geocoder.geocode_many` の結果と、そのバッチの実行統計。
 
-    results: list[GeocodeResult] = field(default_factory=list)
-    usage: Usage = field(default_factory=Usage)
+    **``+`` で畳める。** 段ごとの統計（結果は空）も、並行して走らせたバッチの
+    結果も、同じ演算子でまとめられる。結果は受け取った順につながる。
+    """
+
+    results: tuple[GeocodeResult, ...] = ()
+    usage: Usage = Usage()
     #: Jev を呼ばずに町字が決まった件数
     machiaza_fast_path: int = 0
     #: Jev を呼ばずに番号が決まった件数
     banchi_fast_path: int = 0
-    #: 分割絞り込み のために増えた往復数
+    #: 分割絞り込みのために増えた往復数
     narrow_requests: int = 0
 
-    def merge(self, other: BatchOutcome) -> None:
-        """バッチの結果を後ろに繋ぐ。``run_all`` が並行実行の結果を畳む。"""
-        self.results.extend(other.results)
-        self.machiaza_fast_path += other.machiaza_fast_path
-        self.banchi_fast_path += other.banchi_fast_path
-        self.narrow_requests += other.narrow_requests
-        self.usage.merge(other.usage)
+    def __add__(self, other: BatchOutcome) -> BatchOutcome:
+        return BatchOutcome(
+            results=self.results + other.results,
+            usage=self.usage + other.usage,
+            machiaza_fast_path=self.machiaza_fast_path + other.machiaza_fast_path,
+            banchi_fast_path=self.banchi_fast_path + other.banchi_fast_path,
+            narrow_requests=self.narrow_requests + other.narrow_requests,
+        )

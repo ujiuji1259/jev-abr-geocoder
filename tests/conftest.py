@@ -266,10 +266,9 @@ class FakeModel:
         self.calls.append(list(questions))
         if self.fail:
             raise ports.ModelUnavailable("模擬障害")
-        usage = Usage()
-        usage.add(100, 10)
         return ports.Answers(
-            decisions=[self._decide(i, q) for i, q in enumerate(questions)], usage=usage
+            decisions=tuple(self._decide(i, q) for i, q in enumerate(questions)),
+            usage=Usage(input_tokens=100, output_tokens=10, requests=1),
         )
 
     def _decide(self, index: int, question: ports.Question) -> Decision:

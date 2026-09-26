@@ -73,27 +73,27 @@ def test_city_wide_gives_up_when_beam_is_disabled(index: MachiazaIndex) -> None:
 
     cfg = GeocoderConfig(max_options=3, narrow_by_oaza=False)
     found = CandidateFinder(index, cfg).find(normalize("鳥取県鳥取市面かげ1丁目1-2"))
-    assert found.candidates == []
+    assert found.candidates == ()
     assert found.city_lg_code is not None
 
 
 def test_input_ending_at_city_yields_no_town_candidates(index: MachiazaIndex) -> None:
     found = _finder(index).find(normalize("鳥取県鳥取市"))
-    assert found.candidates == []
+    assert found.candidates == ()
     assert found.ends_at is Granularity.CITY
     assert found.city_lg_code is not None
 
 
 def test_input_ending_at_pref_yields_pref_level(index: MachiazaIndex) -> None:
     found = _finder(index).find(normalize("鳥取県"))
-    assert found.candidates == []
+    assert found.candidates == ()
     assert found.ends_at is Granularity.PREF
     assert found.pref_lg_code is not None
 
 
 def test_non_address_yields_nothing(index: MachiazaIndex) -> None:
     found = _finder(index).find(normalize("ここは住所ではありません"))
-    assert found.candidates == []
+    assert found.candidates == ()
     assert found.ends_at is None
     assert found.city_lg_code is None
 
@@ -163,7 +163,7 @@ def test_trailing_number_is_stripped_before_the_prefix_lookup(index: MachiazaInd
 
 def test_unknown_city_yields_pref_only(index: MachiazaIndex) -> None:
     found = _finder(index).find(normalize("鳥取県そんな市は無い町1-2"))
-    assert found.candidates == []
+    assert found.candidates == ()
     assert found.pref_lg_code is not None
     assert found.city_lg_code is None
 

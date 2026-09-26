@@ -83,20 +83,20 @@ def oaza_question(query: str, normalized: str, options: Sequence[str]) -> ports.
 # ----------------------------------------------------------------- 答えの型
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ChoiceOutcome:
     #: 渡した問と同じ順・同じ長さ。訊けなかったときだけ空。
-    decisions: list[Decision]
+    decisions: tuple[Decision, ...]
     usage: Usage
     #: モデルを呼べなかった場合の理由。空なら正常。
     failure: str = ""
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class NarrowOutcome:
     """各問について、勝ち残った選択肢の添字。"""
 
-    survivors: list[list[int]]
+    survivors: tuple[tuple[int, ...], ...]
     usage: Usage
     failure: str = ""
 
@@ -109,7 +109,7 @@ class Chooser:
     async def ask(self, questions: Sequence[ports.Question]) -> ChoiceOutcome:
         """**1 リクエストで**全問に答えさせる。例外は投げない。"""
         if not questions:
-            return ChoiceOutcome(decisions=[], usage=Usage())
+            return ChoiceOutcome(decisions=(), usage=Usage())
         try:
             result = await self._model.choose(questions)
         except Exception as exc:  # noqa: BLE001 - 外部モデルの不調で落とさない
@@ -117,10 +117,10 @@ class Chooser:
             # 候補の先頭へフォールバックさせる。アダプタが包み忘れた想定外の
             # 例外も同じ扱いにする。
             _log.warning("判定モデルの呼び出しに失敗: %s", exc)
-            return ChoiceOutcome(decisions=[], usage=Usage(), failure=str(exc))
-        decisions = list(result.decisions)
+            return ChoiceOutcome(decisions=(), usage=Usage(), failure=str(exc))
         # 契約では問と同じ長さだが、足りなければ「答えなし」で埋める。
-        decisions.extend(Decision.unanswered() for _ in range(len(questions) - len(decisions)))
+        missing = len(questions) - len(result.decisions)
+        decisions = (*result.decisions, *(Decision.unanswered() for _ in range(missing)))
         return ChoiceOutcome(decisions=decisions, usage=result.usage)
 
     async def narrow(self, questions: Sequence[ports.Question]) -> NarrowOutcome:
@@ -137,7 +137,7 @@ class Chooser:
         絞り込みの基準はここでも設けない。どれを残すかはモデルが決める。
         """
         if not questions:
-            return NarrowOutcome(survivors=[], usage=Usage())
+            return NarrowOutcome(survivors=(), usage=Usage())
 
         size = self._cfg.max_candidates
         # (問の添字, 分割番号, 選択肢) を平らに並べてから詰める。
@@ -149,17 +149,19 @@ class Chooser:
         groups = _pack(chunks, self._cfg.narrow_token_budget, self._cfg.narrow_inputs_per_request)
         results = await asyncio.gather(*(self._narrow_group(questions, g) for g in groups))
 
-        survivors: list[list[int]] = [[] for _ in questions]
+        kept: list[list[int]] = [[] for _ in questions]
         usage = Usage()
         failure = ""
         for picked, group_usage, group_failure in results:
-            usage.merge(group_usage)
+            usage += group_usage
             failure = failure or group_failure
             for question_index, option_index in picked:
-                survivors[question_index].append(option_index)
-        for kept in survivors:
-            kept.sort()
-        return NarrowOutcome(survivors=survivors, usage=usage, failure=failure)
+                kept[question_index].append(option_index)
+        return NarrowOutcome(
+            survivors=tuple(tuple(sorted(indexes)) for indexes in kept),
+            usage=usage,
+            failure=failure,
+        )
 
     async def _narrow_group(
         self, questions: Sequence[ports.Question], group: Sequence[_Chunk]

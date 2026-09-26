@@ -4,9 +4,9 @@
 
 ---
 
-## 1. 設計を貫く4つの制約
+## 1. 設計を貫く5つの制約
 
-この4つが、以下のモジュール分割とインターフェースのほぼすべてを決めている。
+この5つが、以下のモジュール分割とインターフェースのほぼすべてを決めている。
 
 ### 制約1: Jev 呼び出しは「バッチ全体で2回」
 
@@ -34,6 +34,24 @@ TypeSafe のドキュメントが「人間がレビューすべきは質問と�
 
 どの実装を使うかを決めるのは**合成の根だけ** — `adapters/__init__.py`、`Geocoder.open`、`cli.py`、`index.build.build`。それ以外の場所に具体的なクラス名は出てこない。
 
+### 制約5: 値は書き換えない
+
+**dataclass はすべて `frozen=True`。** 列も候補も判定も結果も、作ったあとは変わらない。持ち替えるときは `dataclasses.replace` で写しを作る。
+
+解決は 4 段（候補生成 → 分割絞り込み → 町字 → 番号）あり、**途中状態を共有して書き換えると「いま何が決まっているのか」がコードから読めなくなる**。段が順に同じオブジェクトを書く設計だと、ある段が書いた値を次の段が上書きしたのか、そもそも書かなかったのかが実行順に依存してしまう。だから各段は
+
+```python
+items, stats = await self._resolve_machiaza(items, records)
+```
+
+のように **`(新しい Resolution の列, その段の統計)` を返す**。決まったものだけ差し替えた新しい列が次の段の入力になる。判定モデルに投げる問は `Resolution` の参照ではなく**位置**（`_Pending.position`）で宛先を指す — 参照を持ち回ると古い写しに書いてしまう。
+
+数え上げは `+` で畳む。`Usage` と `BatchOutcome` に `__add__` があり、段ごとの統計と並行して走らせたバッチの結果を同じ演算子でまとめられる。
+
+**可変でよいのは「溜める器」だけ** — `MachiazaTable`（畳み込みで既存の行を差し替える）、SQLite の接続、関数の中の一時リスト。器は dataclass にしないので、「dataclass はすべて frozen」を機械的に確かめれば境界が保てる（`tests/test_immutability.py`）。
+
+結果が frozen だと、キャッシュに入れても複数のワーカーに渡しても安全という実利もある。
+
 ---
 
 ## 2. モジュール構成
@@ -43,7 +61,7 @@ src/jev_abr_geocoder/
 ├── __init__.py          公開 API: Geocoder, GeocodeResult, Granularity, GeocoderConfig, ports
 ├── address.py           住所の値型（表記・レコード・粒度）。すべて frozen
 ├── decision.py          判定モデルの答えと使用量
-├── outcome.py           出力の値型（GeocodeResult, BatchOutcome）。ここだけ可変
+├── outcome.py           出力の値型（GeocodeResult, BatchOutcome）
 ├── ports.py             ★ 外部依存の境界の唯一の置き場（Protocol と境界の値型）
 ├── config.py            ★ 質問文と閾値の唯一の置き場
 ├── textnorm.py          NFKC + 空白除去。これだけ
@@ -463,6 +481,7 @@ CONTAINS_ANSWER_INSTRUCTIONS = "..."
 | `ports` | 境界の値型（ヘッダの大小文字、304 の扱い） | 不要 |
 | `index/keys` | エイリアス生成規則と突き合わせ鍵の表テスト | 不要 |
 | `index/machiaza_table` | 畳み込みの 3 つの型を合成データで | 不要 |
+| イミュータブル性 | dataclass がすべて frozen か、`+` が元を変えないか | 不要 |
 | `abr/geolonia` | 偽の HttpClient で取得と読み | 不要 |
 | `match/numbers` | 番号体系の落とし方を偽の索引で | 不要 |
 | `index/banchi_codec` | encode → decode ラウンドトリップ | 不要 |

@@ -21,7 +21,7 @@ ABR の ``mt_town`` は**同じ場所を複数の行で持つ**ことがあり�
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 
 from ..abr.geolonia import GeoloniaTown
 from ..abr.rows import MachiazaRow
@@ -48,9 +48,9 @@ class MachiazaStats:
     geolonia_merged: int
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class _Row:
-    """組み立て中の 1 行。畳み込みのあいだだけ可変で持つ。"""
+    """組み立て中の 1 行。畳むときは写しを作って差し替える。"""
 
     row_id: int
     lg_code: int
@@ -60,7 +60,7 @@ class _Row:
     point: Point | None
     source: str = "abr"
     #: 同じ場所の別レコードの machiaza_id。
-    alt_machiaza: list[int] = field(default_factory=list)
+    alt_machiaza: tuple[int, ...] = ()
 
     def to_record(self) -> MachiazaRecord:
         return MachiazaRecord(
@@ -71,12 +71,17 @@ class _Row:
             rsdt_addr_flg=self.rsdt_addr_flg,
             point=self.point,
             source=self.source,
-            alt_machiaza=tuple(self.alt_machiaza),
+            alt_machiaza=self.alt_machiaza,
         )
 
 
 class MachiazaTable:
-    """町字の行と (索引鍵, row_id) の組を溜める。"""
+    """町字の行と (索引鍵, row_id) の組を溜める**器**。
+
+    溜めるあいだは中身を持ち替える（畳み込みで既存の行を差し替えるため）。
+    外へ出すのは :attr:`records` / :attr:`pairs` / :attr:`stats` の 3 つで、
+    いずれも frozen な値。ここが唯一の可変な部品で、ほかは書き換えない。
+    """
 
     def __init__(self) -> None:
         self._rows: list[_Row] = []
@@ -92,13 +97,13 @@ class MachiazaTable:
         self._geolonia_merged = 0
 
     @property
-    def records(self) -> list[MachiazaRecord]:
-        return [row.to_record() for row in self._rows]
+    def records(self) -> tuple[MachiazaRecord, ...]:
+        return tuple(row.to_record() for row in self._rows)
 
     @property
-    def pairs(self) -> list[tuple[str, int]]:
+    def pairs(self) -> tuple[tuple[str, int], ...]:
         """(索引鍵, row_id)。同じ鍵が複数の町字を指すことはある（同名の町字）。"""
-        return self._pairs
+        return tuple(self._pairs)
 
     @property
     def stats(self) -> MachiazaStats:
@@ -121,7 +126,7 @@ class MachiazaTable:
             twin = self._by_machiaza.get(row.machiaza_key)
             if twin is not None:
                 # 同じ machiaza_id の 2 行目。行は足さない。
-                self._absorb(twin, row)
+                self._rows[twin] = _absorbed(self._rows[twin], row)
                 continue
 
             place = _place_of(row.lg_code, row.name)
@@ -131,8 +136,8 @@ class MachiazaTable:
                 # 地番は空間的に隣接していて番号帯だけが 1..11 と 42..101 に
                 # 割れていた。鳥取県の 88 組では片側の地番が 0 件（幽霊）。
                 # **両方の machiaza_id を持たせて層2 は両方引く。**
-                self._rows[twin].alt_machiaza.append(row.machiaza_id)
-                self._absorb(twin, row)
+                kept = _absorbed(self._rows[twin], row)
+                self._rows[twin] = replace(kept, alt_machiaza=(*kept.alt_machiaza, row.machiaza_id))
                 self._by_machiaza[row.machiaza_key] = twin
                 self._grow(twin, aliases)
                 self._folded += 1
@@ -148,18 +153,6 @@ class MachiazaTable:
             )
             self._by_machiaza[row.machiaza_key] = index
             self._by_place[place] = index
-
-    def _absorb(self, index: int, row: MachiazaRow) -> None:
-        """畳む先に、行を足さずに属性だけ取り込む。
-
-        住居表示がある側の ``rsdt_addr_flg`` を採る。番号の取得は
-        住居番号 -> 街区 -> 地番 と順に試すので、1 に寄せても地番しか無い場合は
-        拾える。代表点は ABR 側が片方にしか入れていないことがあるので埋める。
-        """
-        kept = self._rows[index]
-        kept.rsdt_addr_flg = max(kept.rsdt_addr_flg, row.rsdt_addr_flg)
-        if kept.point is None:
-            kept.point = row.point
 
     # -------------------------------------------------------- Geolonia
 
@@ -213,7 +206,7 @@ class MachiazaTable:
                 # ABR の位置参照は町字をすべては覆っていない。空いていれば埋める。
                 held = self._rows[owner]
                 if held.point is None:
-                    held.point = _point_of(town)
+                    self._rows[owner] = replace(held, point=_point_of(town))
                 continue
 
             index = self._append(
@@ -264,6 +257,20 @@ class MachiazaTable:
         already = self._grown.setdefault(index, machiaza_aliases(self._rows[index].name))
         self._pairs.extend((alias, index) for alias in aliases - already)
         already |= aliases
+
+
+def _absorbed(kept: _Row, row: MachiazaRow) -> _Row:
+    """畳む先に、行を増やさず属性だけ取り込んだ写し。
+
+    住居表示がある側の ``rsdt_addr_flg`` を採る。番号の取得は
+    住居番号 -> 街区 -> 地番 と順に試すので、1 に寄せても地番しか無い場合は
+    拾える。代表点は ABR 側が片方にしか入れていないことがあるので埋める。
+    """
+    return replace(
+        kept,
+        rsdt_addr_flg=max(kept.rsdt_addr_flg, row.rsdt_addr_flg),
+        point=kept.point or row.point,
+    )
 
 
 def _place_of(lg_code: int, name: MachiazaName) -> _Place:

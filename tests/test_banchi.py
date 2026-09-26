@@ -111,23 +111,23 @@ def test_representative_is_kept_when_nothing_matches_exactly() -> None:
 def test_missing_town_yields_no_options() -> None:
     options = banchi.candidates_for(_Source({}), _machiaza(), parse_banchi_tail("1-2"))
     assert not options
-    assert options.entries == []
+    assert options.entries == ()
 
 
 def test_parents_finds_branch_numbers() -> None:
     options = banchi.BanchiCandidates(
-        entries=[Banchi(936, 1), Banchi(936, 2), Banchi(937)],
+        entries=(Banchi(936, 1), Banchi(936, 2), Banchi(937)),
         kind=BanchiKind.PARCEL,
     )
     assert [e.numbers for e in banchi.parents(options, (936,))] == [(936, 1), (936, 2)]
     # 完全一致は親番扱いにしない。
-    assert banchi.parents(options, (937,)) == []
-    assert banchi.parents(options, ()) == []
+    assert banchi.parents(options, (937,)) == ()
+    assert banchi.parents(options, ()) == ()
 
 
 def test_ranked_keeps_the_closest_numbers() -> None:
     options = banchi.BanchiCandidates(
-        entries=[Banchi(n) for n in (1, 50, 100, 101)], kind=BanchiKind.PARCEL
+        entries=tuple(Banchi(n) for n in (1, 50, 100, 101)), kind=BanchiKind.PARCEL
     )
     assert [e.num1 for e in banchi.ranked(options, (100,), 2).entries] == [100, 101]
     # 上限内なら並べ替えない。

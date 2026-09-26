@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .. import ports
@@ -41,8 +41,10 @@ _KIND_TO_BANCHI: dict[str, BanchiKind] = {
 }
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class BuildReport:
+    """構築の内訳。**frozen。** 数え上がるにつれ写しを作って持ち替える。"""
+
     level: BuildLevel
     files_selected: int = 0
     files_downloaded: int = 0
@@ -58,14 +60,26 @@ class BuildReport:
     trie_keys: int = 0
     banchi: int = 0
     elapsed: float = 0.0
-    notes: list[str] = field(default_factory=list)
+    notes: tuple[str, ...] = ()
 
-    def apply(self, stats: MachiazaStats) -> None:
-        self.towns = stats.towns
-        self.trie_keys = stats.trie_keys
-        self.machiaza_folded = stats.folded
-        self.geolonia_added = stats.geolonia_added
-        self.geolonia_merged = stats.geolonia_merged
+    def with_machiaza(self, stats: MachiazaStats) -> BuildReport:
+        """層1 の内訳を取り込んだ写し。"""
+        return replace(
+            self,
+            towns=stats.towns,
+            trie_keys=stats.trie_keys,
+            machiaza_folded=stats.folded,
+            geolonia_added=stats.geolonia_added,
+            geolonia_merged=stats.geolonia_merged,
+        )
+
+    def noted(self, note: str) -> BuildReport:
+        """注記を足した写し。取り込みは続けるが、後で人に見せる。"""
+        return replace(self, notes=(*self.notes, note))
+
+    def finished(self, started: float) -> BuildReport:
+        """所要時間を入れた写し。返す直前に呼ぶ。"""
+        return replace(self, elapsed=time.monotonic() - started)
 
 
 def _pair_files(downloads: Sequence[Downloaded]) -> list[tuple[Downloaded, Downloaded | None]]:
@@ -218,11 +232,9 @@ async def build(
             notify("catalog", 1, 1, f"{len(refs):,} ファイル")
 
         selected = select(refs, kinds_for_level(level), prefs=prefs, cities=cities)
-        report.files_selected = len(selected)
+        report = replace(report, files_selected=len(selected))
         if not selected:
-            report.notes.append("該当するファイルが無い")
-            report.elapsed = time.monotonic() - started
-            return report
+            return report.noted("該当するファイルが無い").finished(started)
 
         downloader = Downloader(data_dir / "cache", client, concurrency=concurrency)
         downloads = await downloader.download_all(
@@ -237,13 +249,16 @@ async def build(
                 geolonia_csv = await geolonia.download(data_dir / "cache", client)
                 notify("geolonia", 1, 1, geolonia_csv.name)
             except Exception as exc:  # noqa: BLE001 - 補完なので失敗しても続ける
-                report.notes.append(f"Geolonia 住所データを取得できなかった: {exc}")
+                report = report.noted(f"Geolonia 住所データを取得できなかった: {exc}")
     finally:
         if http is None:
             await client.close()
 
-    report.files_downloaded = sum(1 for d in downloads if not d.cached)
-    report.files_unchanged = sum(1 for d in downloads if d.cached)
+    report = replace(
+        report,
+        files_downloaded=sum(1 for d in downloads if not d.cached),
+        files_unchanged=sum(1 for d in downloads if d.cached),
+    )
 
     by_kind: dict[str, list[Downloaded]] = {}
     for item in downloads:
@@ -256,21 +271,23 @@ async def build(
 
         if "mt_pref" in by_kind:
             notify("layer1", 0, 3, "都道府県")
-            report.prefs = _build_prefs(
+            prefs_written = _build_prefs(
                 store,
                 [d.path for d in by_kind["mt_pref"]],
                 [d.path for d in by_kind.get("mt_pref_pos", [])],
             )
+            report = replace(report, prefs=prefs_written)
         if "mt_city" in by_kind:
             notify("layer1", 1, 3, "市区町村")
-            report.cities = _build_cities(
+            cities_written = _build_cities(
                 store,
                 [d.path for d in by_kind["mt_city"]],
                 [d.path for d in by_kind.get("mt_city_pos", [])],
             )
+            report = replace(report, cities=cities_written)
         if "mt_town" in by_kind:
             notify("layer1", 2, 3, "町字とトライ")
-            report.apply(
+            report = report.with_machiaza(
                 _build_machiaza(
                     store,
                     backend,
@@ -304,7 +321,7 @@ async def build(
                 continue
             notify("layer2", index + 1, len(number_pairs), text.ref.filename)
             written = _ingest_banchi(store, kind, text.path, pos.path if pos else None)
-            report.banchi += written
+            report = replace(report, banchi=report.banchi + written)
             store.mark_source(text.ref.url, text.ref.kind, text.last_modified, written)
             store.commit()
 
@@ -317,5 +334,4 @@ async def build(
         if writer is None:
             store.close()
 
-    report.elapsed = time.monotonic() - started
-    return report
+    return report.finished(started)
