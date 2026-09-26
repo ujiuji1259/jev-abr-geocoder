@@ -174,9 +174,7 @@ def _human(result: GeocodeResult) -> str:
     bits = [f"{result.query}  ->  {head}", f"  粒度      : {result.granularity.label}"]
     if result.lat is not None and result.lon is not None:
         source = (
-            f"  ({result.point_granularity.label}の代表点で代用)"
-            if result.point_is_coarser
-            else ""
+            f"  ({result.point_granularity.label}の代表点で代用)" if result.point_is_coarser else ""
         )
         bits.append(f"  座標      : {result.lat:.6f}, {result.lon:.6f}{source}")
     codes = [

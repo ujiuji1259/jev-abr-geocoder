@@ -133,9 +133,7 @@ _MACHIAZA = [
     ),
     # ABR に代表点が無い町字（全国 442,178 件、96% は小字レベル）。
     # 市区町村の代表点で代用され、point_granularity が CITY になる。
-    _Machiaza(
-        312011, 96000, "鳥取県", "", "鳥取市", "", "青谷町", "", "", "字杉下", 0, None, None
-    ),
+    _Machiaza(312011, 96000, "鳥取県", "", "鳥取市", "", "青谷町", "", "", "字杉下", 0, None, None),
     # ABR が同じ場所を「字○○」と「○○」の 2 レコードに分けて持ち、地番も
     # 両方に割れている型（栗原市築館新田で実測）。代表 1 行に畳み、
     # alt_machiaza にもう一方の machiaza_id を持たせる。
@@ -205,9 +203,7 @@ def data_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
             for lg, name, lat, lon in _PREFS
         )
         store.replace_cities(
-            CityRecord(
-                lg_code=lg, pref=pref, county=county, city=city, ward=ward, point=point
-            )
+            CityRecord(lg_code=lg, pref=pref, county=county, city=city, ward=ward, point=point)
             for lg, pref, county, city, ward, point in _CITIES
         )
         records: list[MachiazaRecord] = []

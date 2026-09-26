@@ -41,9 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from jev_abr_geocoder import Geocoder, GeocoderConfig, adapters  # noqa: E402
 from jev_abr_geocoder.index.keys import match_key  # noqa: E402
 
-DATA_URL = (
-    "https://www.post.japanpost.jp/service/search/zipcode/download/utf/zip/utf_ken_all.zip"
-)
+DATA_URL = "https://www.post.japanpost.jp/service/search/zipcode/download/utf/zip/utf_ken_all.zip"
 SOURCE = "郵便番号データ（日本郵便株式会社）"
 
 #: 町域名に入る、住所ではない断り書き。この行は評価に使えない。
@@ -179,8 +177,12 @@ async def main() -> None:
     print(f"  正解率        {city_ok:>7,} / {n:,}  {city_ok / n:.2%}")
     print("\n町字（準金ラベル）")
     print(f"  町字まで到達  {town_reached:>7,}  {town_reached / n:.1%}")
-    print(f"  町域名と一致  {town_match:>7,}  {town_match / n:.1%}"
-          f"  (到達分のうち {town_match / town_reached:.1%})" if town_reached else "")
+    print(
+        f"  町域名と一致  {town_match:>7,}  {town_match / n:.1%}"
+        f"  (到達分のうち {town_match / town_reached:.1%})"
+        if town_reached
+        else ""
+    )
     print("\n粒度の分布")
     for label, count in levels.most_common():
         print(f"  {label:8} {count:>7,}  {count / n:.1%}")
