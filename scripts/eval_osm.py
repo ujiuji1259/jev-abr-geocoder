@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from jev_abr_geocoder import Geocoder, GeocoderConfig, adapters  # noqa: E402
 from jev_abr_geocoder.address import Point  # noqa: E402
 from jev_abr_geocoder.index.keys import match_key  # noqa: E402
+from jev_abr_geocoder.outcome import BatchOutcome  # noqa: E402
 
 #: 公開の Overpass。混むと 504 を返すので順に当てる。
 MIRRORS = (
@@ -69,10 +70,12 @@ class Case:
     city: str
     town: str
     point: Point
+    #: True なら :attr:`town` に住所全体が入っている（番号レベルの評価）。
+    composed: bool = False
 
     @property
     def query(self) -> str:
-        return f"{self.pref}{self.city}{self.town}"
+        return self.town if self.composed else f"{self.pref}{self.city}{self.town}"
 
 
 def _overpass(query: str, cache: Path) -> dict[str, object]:
@@ -153,6 +156,73 @@ def cases_in(pref: str, city: str, cache_dir: Path) -> list[Case]:
     return out
 
 
+def number_cases_in(city: str, cache_dir: Path) -> list[Case]:
+    """``addr:housenumber`` を持つ対象。番号レベルの評価に使う。
+
+    日本の OSM は ``addr:province`` / ``addr:city`` / ``addr:quarter``（町字）/
+    ``addr:block_number``（街区符号・地番の親番）/ ``addr:housenumber`` で住所を
+    持つ。``addr:full`` があるときはそれを優先する — 人が書いた住所文字列その
+    ままなので、入力としてはこちらが本物に近い。
+
+    **被覆率は測れないが precision は測れる。** OSM にあるのは誰かが現地調査した
+    場所だけで ABR の 1% 程度しかないので、ここから再現率は推定できない。ただし
+    「OSM にある分について、こちらの答えが合っているか」は測れる。母集団が駅前や
+    施設に偏っていることは解釈の際に引く。
+    """
+    cache = cache_dir / f"osm-numbers-{city}.json"
+    payload: dict[str, object] = {}
+    for level in CITY_LEVELS:
+        query = (
+            f'[out:json][timeout:180];area["name"="{city}"]["admin_level"="{level}"]->.a;'
+            f'nwr(area.a)["addr:housenumber"];out tags center;'
+        )
+        payload = _overpass(query, cache)
+        elements = payload.get("elements", [])
+        if isinstance(elements, list) and elements:
+            break
+        cache.unlink(missing_ok=True)
+
+    elements = payload.get("elements", [])
+    out: list[Case] = []
+    for element in elements if isinstance(elements, list) else []:
+        if not isinstance(element, dict):
+            continue
+        tags = element.get("tags", {})
+        center = element.get("center", {})
+        lat = element.get("lat", center.get("lat") if isinstance(center, dict) else None)
+        lon = element.get("lon", center.get("lon") if isinstance(center, dict) else None)
+        if lat is None or lon is None:
+            continue
+        query = _address_of(tags)
+        if not query:
+            continue
+        out.append(
+            Case(
+                pref=tags.get("addr:province", ""),
+                city=city,
+                town=query,
+                point=Point(lat=float(lat), lon=float(lon)),
+                composed=True,
+            )
+        )
+    return out
+
+
+def _address_of(tags: dict[str, str]) -> str:
+    """OSM のタグから住所文字列を組む。組めなければ空。"""
+    full = tags.get("addr:full", "").strip()
+    if full:
+        return full
+    pref, city = tags.get("addr:province", ""), tags.get("addr:city", "")
+    town = tags.get("addr:quarter", "") + tags.get("addr:neighbourhood", "")
+    if not (pref and city and town):
+        # 町字が無いと番地だけになってしまう。評価に使えない。
+        return ""
+    block, house = tags.get("addr:block_number", ""), tags.get("addr:housenumber", "")
+    number = f"{block}-{house}" if block else house
+    return f"{pref}{city}{town}{number}"
+
+
 def _unambiguous(cases: list[Case]) -> tuple[list[Case], int]:
     """同じ市区町村に同名のノードが複数あるものを外す。
 
@@ -180,11 +250,55 @@ def _percentile(values: list[float], q: float) -> float:
     return sorted(values)[min(len(values) - 1, int(len(values) * q))]
 
 
+#: 番号まで解決できた粒度。
+_NUMBER_LEVELS = ("街区", "住居番号", "地番")
+
+
+def _report_numbers(cases: list[Case], outcome: BatchOutcome, elapsed: float) -> None:
+    """番号レベルの precision。距離は建物に打たれた点との隔たりなので数十 m を見る。"""
+    levels: Counter[str] = Counter()
+    distances: list[float] = []
+    far: list[tuple[Case, str, float]] = []
+    for case, result in zip(cases, outcome.results, strict=True):
+        levels[result.granularity.label] += 1
+        if result.granularity.label not in _NUMBER_LEVELS or result.point is None:
+            continue
+        d = distance_m(case.point, result.point)
+        distances.append(d)
+        if d > 200 and len(far) < 8:
+            far.append((case, result.address, d))
+
+    n = len(cases)
+    reached = sum(levels[label] for label in _NUMBER_LEVELS)
+    print(f"入力 {n:,} 件  所要 {elapsed:.1f} 秒  Jev 往復 {outcome.usage.requests}")
+    print("\n粒度の分布")
+    for label, count in levels.most_common():
+        print(f"  {label:8} {count:>6,}  {count / n:.1%}")
+    print(f"\n番号まで到達 {reached:,} / {n:,}  ({reached / n:.1%})")
+    if distances:
+        print("到達した分について、OSM が建物に打った点との隔たり [m]")
+        for label, q in (("p50", 0.50), ("p90", 0.90), ("p99", 0.99)):
+            print(f"  {label}  {_percentile(distances, q):>8,.0f}")
+        print(f"  max  {max(distances):>8,.0f}")
+        for threshold in (50, 200, 1000):
+            within = sum(1 for d in distances if d <= threshold)
+            print(f"  {threshold:>5} m 以内  {within:>6,}  {within / len(distances):.1%}")
+    if far:
+        print("\n200 m 以上離れた例")
+        for case, address, d in far:
+            print(f"  {d:>8,.0f} m  {case.query:32} -> {address}")
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--pref", help="この都道府県の市区町村を全部")
     parser.add_argument("--city", action="append", default=[], help="市区町村名。複数可")
+    parser.add_argument(
+        "--numbers",
+        action="store_true",
+        help="番号レベルを測る（addr:housenumber を持つ対象）。層2 を入れた索引が要る",
+    )
     parser.add_argument("--model", action="store_true", help="Jev を使う")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--concurrency", type=int, default=4)
@@ -203,14 +317,22 @@ async def main() -> None:
 
     found: list[Case] = []
     for city in targets:
+        if args.numbers:
+            found.extend(number_cases_in(city, cache_dir))
+            continue
         pref = args.pref or pref_of.get(city, "")
         if not pref:
             print(f"  {city}: 都道府県が引けないので飛ばす")
             continue
         found.extend(cases_in(pref, city, cache_dir))
-    cases, ambiguous = _unambiguous(found)
-    print(f"\n{SOURCE}: 町字相当ノード {len(found):,} 件（{len(targets)} 市区町村）")
-    print(f"  同名で曖昧なため除外 {ambiguous:,} 件")
+    if args.numbers:
+        cases, ambiguous = found, 0
+        print(f"\n{SOURCE}: addr:housenumber を持つ対象 {len(found):,} 件")
+        print("  被覆率は測れない（OSM にあるのは現地調査された場所だけ）。測るのは precision")
+    else:
+        cases, ambiguous = _unambiguous(found)
+        print(f"\n{SOURCE}: 町字相当ノード {len(found):,} 件（{len(targets)} 市区町村）")
+        print(f"  同名で曖昧なため除外 {ambiguous:,} 件")
     if not cases:
         return
 
@@ -220,6 +342,10 @@ async def main() -> None:
     with Geocoder.open(args.data_dir, model=model, cfg=cfg) as geocoder:
         outcome = await geocoder.run_all([case.query for case in cases])
     elapsed = time.perf_counter() - started
+
+    if args.numbers:
+        _report_numbers(cases, outcome, elapsed)
+        return
 
     matched: list[float] = []
     renamed: list[tuple[Case, str]] = []

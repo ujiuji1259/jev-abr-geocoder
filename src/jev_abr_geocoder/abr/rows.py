@@ -72,8 +72,8 @@ class BanchiRow:
     machiaza_id: int
     #: 番号 3 つ組。意味は :class:`BanchiKind` で変わる。
     nums: tuple[int, int, int]
-    #: 位置参照拡張と突き合わせるための鍵。
-    record_key: int
+    #: 位置参照拡張と突き合わせるための鍵。**整数に詰めない。**
+    record_key: tuple[int, ...]
 
 
 # ------------------------------------------------------------------ 代表点
@@ -101,9 +101,11 @@ def read_town_positions(paths: Iterable[Path]) -> dict[tuple[int, int, int], Poi
     return out
 
 
-def read_banchi_positions(kind: BanchiKind, path: Path | None) -> dict[int, dict[int, Point]]:
+def read_banchi_positions(
+    kind: BanchiKind, path: Path | None
+) -> dict[int, dict[tuple[int, ...], Point]]:
     """番号の位置参照拡張を lg_code -> 記録鍵 -> 座標 の形にする。"""
-    out: dict[int, dict[int, Point]] = {}
+    out: dict[int, dict[tuple[int, ...], Point]] = {}
     if path is None:
         return out
     for row in csvsrc.read_rows(path):
@@ -222,24 +224,22 @@ def _nums(kind: BanchiKind, row: Mapping[str, str]) -> tuple[int, int, int]:
     return int(prc_id[0:5]), int(prc_id[5:10]), int(prc_id[10:15])
 
 
-def _record_key(kind: BanchiKind, row: Mapping[str, str]) -> int:
-    """本体と位置参照を突き合わせる鍵。ID 列はゼロ詰めなので整数化して使う。"""
+def _record_key(kind: BanchiKind, row: Mapping[str, str]) -> tuple[int, ...]:
+    """本体と位置参照を突き合わせる鍵。ID 列はゼロ詰めなので整数化して使う。
+
+    **タプルのまま使う。** 以前は 1 パート 6 桁の整数に詰めていたが、``prc_id`` は
+    15 桁・``machiaza_id`` は 7 桁あるので桁が溢れ、**別の町字の番号と鍵が衝突して
+    互いの座標を拾っていた**（鳥取市倭文では地番の半分が町字から 13 km 離れていた）。
+    タプルなら桁を考えなくてよい。
+    """
     machiaza = int(row["machiaza_id"])
     if kind is BanchiKind.BLOCK:
-        return _pack(machiaza, int(row["blk_id"]))
+        return (machiaza, int(row["blk_id"]))
     if kind is BanchiKind.RSDT:
-        return _pack(
+        return (
             machiaza,
             int(row["blk_id"]),
             int(row["rsdt_id"]),
             int(row.get("rsdt2_id") or 0),
         )
-    return _pack(machiaza, int(row["prc_id"]))
-
-
-def _pack(*parts: int) -> int:
-    """複数の整数 ID を 1 つの整数鍵にまとめる。"""
-    out = 0
-    for part in parts:
-        out = out * 1_000_000 + part
-    return out
+    return (machiaza, int(row["prc_id"]))
