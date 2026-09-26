@@ -10,9 +10,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from jev_abr_geocoder.abr.geolonia import GeoloniaTown
-from jev_abr_geocoder.abr.rows import TownRow
-from jev_abr_geocoder.index.towntable import TownTable
-from jev_abr_geocoder.models import Point, TownName
+from jev_abr_geocoder.abr.rows import MachiazaRow
+from jev_abr_geocoder.address import MachiazaName, Point
+from jev_abr_geocoder.index.machiaza_table import MachiazaTable
 
 
 def _row(
@@ -25,12 +25,12 @@ def _row(
     flg: int = 0,
     point: Point | None = None,
     lg_code: int = 312011,
-) -> TownRow:
-    return TownRow(
+) -> MachiazaRow:
+    return MachiazaRow(
         lg_code=lg_code,
         machiaza_id=machiaza_id,
         rsdt_addr_flg=flg,
-        name=TownName(
+        name=MachiazaName(
             pref="鳥取県",
             county="",
             city="鳥取市",
@@ -48,14 +48,14 @@ def _geolonia(town: str, *, lat: float | None = None, lon: float | None = None) 
     return GeoloniaTown(pref="鳥取県", city="鳥取市", town=town, koaza="", lat=lat, lon=lon)
 
 
-def _table(rows: Sequence[TownRow]) -> TownTable:
-    table = TownTable()
+def _table(rows: Sequence[MachiazaRow]) -> MachiazaTable:
+    table = MachiazaTable()
     table.add_abr(rows)
     return table
 
 
-def _keys_of(table: TownTable, town_id: int) -> set[str]:
-    return {key for key, value in table.pairs if value == town_id}
+def _keys_of(table: MachiazaTable, row_id: int) -> set[str]:
+    return {key for key, value in table.pairs if value == row_id}
 
 
 def test_same_machiaza_id_collapses_to_one_row() -> None:
@@ -168,5 +168,5 @@ def test_geolonia_matches_across_chome_notation() -> None:
 
 
 def test_empty_table_reports_zeroes() -> None:
-    stats = TownTable().stats
-    assert (stats.towns, stats.keys, stats.folded) == (0, 0, 0)
+    stats = MachiazaTable().stats
+    assert (stats.towns, stats.trie_keys, stats.folded) == (0, 0, 0)

@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-__all__ = ["Tail", "parse_tail"]
+__all__ = ["BanchiTail", "parse_banchi_tail"]
 
 #: 数値の前後に現れる区切り。NFKC 後なので全角は考えなくてよいが、
 #: 長音符・各種ダッシュ・中黒は NFKC でも残る。
@@ -27,7 +27,7 @@ _CONTINUES = ("丁目", "丁", "番地", "番", "号", "地割", "の", "ノ")
 
 
 @dataclass(frozen=True, slots=True)
-class Tail:
+class BanchiTail:
     """町字より後ろの部分。"""
 
     #: 素直に読める数値列。層2 の絞り込みと突き合わせに使う。
@@ -47,7 +47,7 @@ class Tail:
         return bool(self.raw)
 
 
-def parse_tail(text: str) -> Tail:
+def parse_banchi_tail(text: str) -> BanchiTail:
     """残り文字列から先頭の数値列を拾う。
 
     数値と数値の間に助数詞か区切り記号しか無い限り読み進め、それ以外の文字
@@ -57,14 +57,14 @@ def parse_tail(text: str) -> Tail:
     数字が先頭に無い場合は、**最初の数字まで読み飛ばす**。ABR の町字マスターに
     無い小字が残ることがあるため（「福定町字灘屋敷179」の「字灘屋敷」）。
     地番自体は町字の machiaza_id にぶら下がっているので、読み飛ばせば引ける。
-    読み飛ばした分は :attr:`Tail.skipped` に残し、呼び出し側が「町字の解釈が
+    読み飛ばした分は :attr:`BanchiTail.skipped` に残し、呼び出し側が「町字の解釈が
     不完全」と分かるようにする。
 
-    >>> parse_tail("1-2-3〇〇ハイツ301").numbers
+    >>> parse_banchi_tail("1-2-3〇〇ハイツ301").numbers
     (1, 2, 3)
-    >>> parse_tail("1丁目2番3号").numbers
+    >>> parse_banchi_tail("1丁目2番3号").numbers
     (1, 2, 3)
-    >>> parse_tail("字灘屋敷179").numbers, parse_tail("字灘屋敷179").skipped
+    >>> parse_banchi_tail("字灘屋敷179").numbers, parse_banchi_tail("字灘屋敷179").skipped
     ((179,), '字灘屋敷')
     """
     raw = text
@@ -83,7 +83,7 @@ def parse_tail(text: str) -> Tail:
         if gap_end is None:
             break
         pos = gap_end
-    return Tail(numbers=tuple(numbers[:3]), raw=raw, skipped=skipped)
+    return BanchiTail(numbers=tuple(numbers[:3]), raw=raw, skipped=skipped)
 
 
 def _next_number_start(work: str, pos: int) -> int | None:

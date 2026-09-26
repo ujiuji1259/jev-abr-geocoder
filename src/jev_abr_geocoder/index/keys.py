@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import re
 
-from ..models import CityName, TownName
+from ..address import CityName, MachiazaName
 from ..textnorm import normalize
 
 __all__ = [
-    "town_aliases",
+    "machiaza_aliases",
     "city_aliases",
     "pref_variants",
     "kanji_number",
@@ -189,7 +189,7 @@ def city_aliases(name: CityName) -> set[str]:
     return out
 
 
-def town_aliases(name: TownName) -> set[str]:
+def machiaza_aliases(name: MachiazaName) -> set[str]:
     """町字を指す鍵をすべて返す。
 
     都道府県 (3) x 郡 (1-2) x 丁目 (1-3) の直積を、**大字・字の接頭辞の

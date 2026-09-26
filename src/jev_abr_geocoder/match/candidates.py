@@ -30,9 +30,9 @@ import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
+from ..address import Granularity, MachiazaRecord
 from ..config import GeocoderConfig
-from ..index.townindex import TownIndex
-from ..models import Level, TownCandidate, TownRecord
+from ..index.machiaza_index import MachiazaIndex
 
 __all__ = [
     "CandidateFinder",
@@ -67,30 +67,46 @@ def _splits_a_number(key: str, text: str) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class MachiazaCandidate:
+    """層1 が出した町字候補。
+
+    **並び順が順位。** 索引に近いものから並び、上限を超えた分は後ろから落とす。
+    スコアは持たない。数値を持たせると「この値以上なら採用」と書きたくなり、
+    採否の判断が判定モデルからこちら側に漏れる（docs/architecture.md 原則1）。
+    """
+
+    row_id: int
+    #: 入力のうち町字として消費した部分
+    matched: str
+    #: 残り（数値テール + 建物名）
+    remainder: str
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateSet:
-    candidates: list[TownCandidate]
+    candidates: list[MachiazaCandidate]
     #: 索引鍵が入力の先頭として一致したか。診断用。
-    exact: bool
+    prefix_matched: bool
     #: 市区町村までは特定できた場合、その lg_code
     city_lg_code: int | None = None
     #: 都道府県までは特定できた場合、その lg_code
     pref_lg_code: int | None = None
     #: 入力がこの粒度で終わっており、それ以上細かく探す余地が無い場合に設定する。
     #: このとき候補は空だが、その粒度としては確信を持って解決できている。
-    exhausted: Level | None = None
-    #: 候補が Choice の上限を超えており、Jev で分割絞り込み (beam) が要る。
+    ends_at: Granularity | None = None
+    #: 候補が Choice の上限を超えており、Jev で分割絞り込み が要る。
     #: このとき candidates は上限を超えた件数を持つので、そのままでは渡せない。
-    needs_beam: bool = False
+    needs_narrowing: bool = False
 
-    def narrowed(self, candidates: list[TownCandidate]) -> CandidateSet:
+    def narrowed(self, candidates: list[MachiazaCandidate]) -> CandidateSet:
         """絞り込んだ候補で置き換える。
 
-        分割絞り込み (beam) の結果を受ける口。絞り終わっているので
-        ``needs_beam`` は下りる。空を渡せば「候補なし」になり、粒度が落ちる。
+        分割絞り込み の結果を受ける口。絞り終わっているので
+        ``needs_narrowing`` は下りる。空を渡せば「候補なし」になり、粒度が落ちる。
         """
-        return replace(self, candidates=candidates, needs_beam=False)
+        return replace(self, candidates=candidates, needs_narrowing=False)
 
-    def unambiguous(self) -> TownCandidate | None:
+    def unambiguous(self) -> MachiazaCandidate | None:
         """選ぶ余地が無い候補があればそれを返す。
 
         索引鍵が入力の先頭として一致していて、**厳密に最も長く一致した候補が
@@ -101,7 +117,7 @@ class CandidateSet:
         同じ長さで複数が並ぶ場合（京都市中京区に同名の町字が 4 つある等）は
         ``None`` を返して Jev に委ねる。
         """
-        if not self.exact or not self.candidates:
+        if not self.prefix_matched or not self.candidates:
             return None
         longest = max(len(c.matched) for c in self.candidates)
         top = [c for c in self.candidates if len(c.matched) == longest]
@@ -109,14 +125,14 @@ class CandidateSet:
 
 
 class CandidateFinder:
-    def __init__(self, index: TownIndex, cfg: GeocoderConfig) -> None:
+    def __init__(self, index: MachiazaIndex, cfg: GeocoderConfig) -> None:
         self._index = index
         self._cfg = cfg
 
     def find(self, normalized: str) -> CandidateSet:
         """正規化済み入力から町字候補を出す。"""
         if not normalized:
-            return CandidateSet(candidates=[], exact=False)
+            return CandidateSet(candidates=[], prefix_matched=False)
         # 候補が空でも意味のある結果（市区町村で確定など）を返す段があるので、
         # 真偽値ではなく None かどうかで分岐する。
         for step in (self._forward, self._boundary, self._extensions, self._city_wide):
@@ -132,15 +148,15 @@ class CandidateFinder:
         if not hits:
             return None
         seen: set[int] = set()
-        out: list[TownCandidate] = []
+        out: list[MachiazaCandidate] = []
         for hit in hits:  # 長い順
-            if hit.town_id in seen or _splits_a_number(hit.key, normalized):
+            if hit.row_id in seen or _splits_a_number(hit.key, normalized):
                 continue
-            seen.add(hit.town_id)
+            seen.add(hit.row_id)
             out.append(
                 # 長く一致したものほど上位。同点は索引の順。
-                TownCandidate(
-                    town_id=hit.town_id,
+                MachiazaCandidate(
+                    row_id=hit.row_id,
                     matched=hit.key,
                     remainder=normalized[hit.matched_len :],
                 )
@@ -149,7 +165,7 @@ class CandidateFinder:
                 break
         city = self._index.city_prefixes(normalized)
         return CandidateSet(
-            candidates=out, exact=True, city_lg_code=city[0].lg_code if city else None
+            candidates=out, prefix_matched=True, city_lg_code=city[0].lg_code if city else None
         )
 
     # ------------------------------ ② 入力がちょうど市区町村・都道府県で終わる
@@ -165,17 +181,17 @@ class CandidateFinder:
         if city_hits and city_hits[0].matched_len >= len(normalized):
             return CandidateSet(
                 candidates=[],
-                exact=True,
+                prefix_matched=True,
                 city_lg_code=city_hits[0].lg_code,
-                exhausted=Level.CITY,
+                ends_at=Granularity.CITY,
             )
         pref_hit = self._index.pref_prefix(normalized)
         if pref_hit is not None and len(pref_hit[1]) >= len(normalized):
             return CandidateSet(
                 candidates=[],
-                exact=True,
+                prefix_matched=True,
                 pref_lg_code=pref_hit[0].lg_code,
-                exhausted=Level.PREF,
+                ends_at=Granularity.PREF,
             )
         return None
 
@@ -197,25 +213,25 @@ class CandidateFinder:
             stems.append(stripped)
 
         for stem in stems:
-            keys = self._index.keys_under(stem, self._cfg.max_candidates * 4)
+            keys = self._index.machiaza_extensions(stem, self._cfg.max_candidates * 4)
             if not keys:
                 continue
             # 入力からの継ぎ足しが短いものほど「言いかけ」に近い。
             # 長さで切るのは類似度の判断ではなく、255 件に収める機械的な規則。
             keys.sort(key=lambda item: (len(item[0]), item[0]))
             seen: set[int] = set()
-            out: list[TownCandidate] = []
+            out: list[MachiazaCandidate] = []
             remainder = normalized[len(stem) :]
-            for _key, town_id in keys:
-                if town_id in seen:
+            for _key, row_id in keys:
+                if row_id in seen:
                     continue
-                seen.add(town_id)
-                out.append(TownCandidate(town_id=town_id, matched=stem, remainder=remainder))
+                seen.add(row_id)
+                out.append(MachiazaCandidate(row_id=row_id, matched=stem, remainder=remainder))
                 if len(out) >= self._cfg.max_candidates:
                     break
             city = self._index.city_prefixes(normalized)
             return CandidateSet(
-                candidates=out, exact=False, city_lg_code=city[0].lg_code if city else None
+                candidates=out, prefix_matched=False, city_lg_code=city[0].lg_code if city else None
             )
         return None
 
@@ -231,7 +247,7 @@ class CandidateFinder:
         ここでは順位づけも足切りもしない。市区町村が決まっていれば母集団は
         高々その町字数で、74% の市区町村は 255 件に収まる。
 
-        収まらない場合（26%、最大は福井市の 15,399 件）は ``needs_beam`` を
+        収まらない場合（26%、最大は福井市の 15,399 件）は ``needs_narrowing`` を
         立てて全件を持ち帰る。何を落とすかの判断はやはりこちらではせず、
         分割して Jev に「この一覧の中にあるか」を並列に訊いて絞る。
         """
@@ -240,14 +256,14 @@ class CandidateFinder:
             return None
         best = city_hits[0]
         limit = self._cfg.max_candidates
-        ceiling = self._cfg.beam_max_candidates if self._cfg.beam else limit
-        keys = self._index.keys_under(best.key, (ceiling + 1) * 8)
+        ceiling = self._cfg.narrow_max_machiaza if self._cfg.narrow_by_oaza else limit
+        keys = self._index.machiaza_extensions(best.key, (ceiling + 1) * 8)
         seen: dict[int, str] = {}
-        for key, town_id in keys:
-            if town_id not in seen:
-                seen[town_id] = key
+        for key, row_id in keys:
+            if row_id not in seen:
+                seen[row_id] = key
             if len(seen) > ceiling:
-                # beam でも扱いきれない規模。粒度を落とす。
+                # 分割絞り込みでも扱いきれない規模。粒度を落とす。
                 return None
         if not seen:
             return None
@@ -259,13 +275,14 @@ class CandidateFinder:
         remainder = normalized[cut:]
         matched = normalized[:cut]
         candidates = [
-            TownCandidate(town_id=town_id, matched=matched, remainder=remainder) for town_id in seen
+            MachiazaCandidate(row_id=row_id, matched=matched, remainder=remainder)
+            for row_id in seen
         ]
         return CandidateSet(
             candidates=candidates,
-            exact=False,
+            prefix_matched=False,
             city_lg_code=best.lg_code,
-            needs_beam=len(candidates) > limit,
+            needs_narrowing=len(candidates) > limit,
         )
 
     # ------------------------------------------- ⑤ 粒度を落とす
@@ -280,29 +297,29 @@ class CandidateFinder:
         city_hits = self._index.city_prefixes(normalized)
         if city_hits:
             best = city_hits[0]
-            exhausted = Level.CITY if best.matched_len >= len(normalized) else None
+            ends_at = Granularity.CITY if best.matched_len >= len(normalized) else None
             return CandidateSet(
-                candidates=[], exact=False, city_lg_code=best.lg_code, exhausted=exhausted
+                candidates=[], prefix_matched=False, city_lg_code=best.lg_code, ends_at=ends_at
             )
 
         pref_hit = self._index.pref_prefix(normalized)
         if pref_hit is not None:
-            exhausted = Level.PREF if len(pref_hit[1]) >= len(normalized) else None
+            ends_at = Granularity.PREF if len(pref_hit[1]) >= len(normalized) else None
             return CandidateSet(
                 candidates=[],
-                exact=False,
+                prefix_matched=False,
                 pref_lg_code=pref_hit[0].lg_code,
-                exhausted=exhausted,
+                ends_at=ends_at,
             )
-        return CandidateSet(candidates=[], exact=False)
+        return CandidateSet(candidates=[], prefix_matched=False)
 
 
 # ------------------------------------------------- 候補のまとめ方
 
 
 def group_by_display(
-    candidates: Sequence[TownCandidate], records: dict[int, TownRecord]
-) -> list[list[TownCandidate]]:
+    candidates: Sequence[MachiazaCandidate], records: dict[int, MachiazaRecord]
+) -> list[list[MachiazaCandidate]]:
     """表示住所ごとにまとめる。出現順を保つ。
 
     **表示が同じ候補を判定モデルに重ねて見せない。** 京都市中京区には同名の
@@ -310,25 +327,25 @@ def group_by_display(
     答えようがないので確信度が割れ、住所としては正しいのに閾値を下回って
     粒度が落ちていた。
     """
-    return _group(candidates, lambda record: record.display, records)
+    return _group(candidates, lambda record: record.name.display, records)
 
 
 def group_by_oaza(
-    candidates: Sequence[TownCandidate], records: dict[int, TownRecord]
-) -> list[list[TownCandidate]]:
+    candidates: Sequence[MachiazaCandidate], records: dict[int, MachiazaRecord]
+) -> list[list[MachiazaCandidate]]:
     """大字ごとにまとめる。出現順を保つ。
 
     候補が上限を超えた市区町村で、先に大字だけを選ばせるときの単位。
     """
-    return _group(candidates, lambda record: record.oaza_display, records)
+    return _group(candidates, lambda record: record.name.oaza_display, records)
 
 
 def _group(
-    candidates: Sequence[TownCandidate],
-    key: Callable[[TownRecord], str],
-    records: dict[int, TownRecord],
-) -> list[list[TownCandidate]]:
-    groups: dict[str, list[TownCandidate]] = {}
+    candidates: Sequence[MachiazaCandidate],
+    key: Callable[[MachiazaRecord], str],
+    records: dict[int, MachiazaRecord],
+) -> list[list[MachiazaCandidate]]:
+    groups: dict[str, list[MachiazaCandidate]] = {}
     for candidate in candidates:
-        groups.setdefault(key(records[candidate.town_id]), []).append(candidate)
+        groups.setdefault(key(records[candidate.row_id]), []).append(candidate)
     return list(groups.values())

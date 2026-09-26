@@ -14,7 +14,7 @@ ABR の ``mt_town`` は**同じ場所を複数の行で持つ**ことがあり�
 2 と 3 では **行を足さずに索引鍵だけを足す**。別行にすると 1 つの鍵が 2 つの
 町字を指してしまう。
 
-呼ぶ順は :meth:`TownTable.add_abr` -> :meth:`TownTable.add_geolonia`。後者は
+呼ぶ順は :meth:`MachiazaTable.add_abr` -> :meth:`MachiazaTable.add_geolonia`。後者は
 前者が作った市区町村の一覧から ``lg_code`` を引くため。
 """
 
@@ -24,22 +24,22 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from ..abr.geolonia import GeoloniaTown
-from ..abr.rows import TownRow
-from ..models import CityName, Point, TownName, TownRecord
-from .keys import match_key, town_aliases, without_prefix
+from ..abr.rows import MachiazaRow
+from ..address import CityName, MachiazaName, MachiazaRecord, Point
+from .keys import machiaza_aliases, match_key, without_prefix
 
-__all__ = ["TownTable", "TownStats"]
+__all__ = ["MachiazaTable", "MachiazaStats"]
 
 #: 同じ場所かどうかを見る鍵。大字・字の接頭辞は落としてから比べる。
 _Place = tuple[int, str, str, str]
 
 
 @dataclass(frozen=True, slots=True)
-class TownStats:
+class MachiazaStats:
     """構築の内訳。CLI が報告に出す。"""
 
     towns: int
-    keys: int
+    trie_keys: int
     #: ABR 内で同じ場所としてまとめた行数。
     folded: int
     #: ABR に無くて Geolonia から補った町字。
@@ -52,37 +52,31 @@ class TownStats:
 class _Row:
     """組み立て中の 1 行。畳み込みのあいだだけ可変で持つ。"""
 
-    town_id: int
+    row_id: int
     lg_code: int
     machiaza_id: int
-    name: TownName
+    name: MachiazaName
     rsdt_addr_flg: int
     point: Point | None
     source: str = "abr"
     #: 同じ場所の別レコードの machiaza_id。
-    alt: list[int] = field(default_factory=list)
+    alt_machiaza: list[int] = field(default_factory=list)
 
-    def to_record(self) -> TownRecord:
-        return TownRecord(
-            town_id=self.town_id,
+    def to_record(self) -> MachiazaRecord:
+        return MachiazaRecord(
+            row_id=self.row_id,
             lg_code=self.lg_code,
             machiaza_id=self.machiaza_id,
-            pref=self.name.pref,
-            county=self.name.county,
-            city=self.name.city,
-            ward=self.name.ward,
-            oaza_cho=self.name.oaza_cho,
-            chome=self.name.chome,
-            koaza=self.name.koaza,
+            name=self.name,
             rsdt_addr_flg=self.rsdt_addr_flg,
             point=self.point,
             source=self.source,
-            alt_machiaza=tuple(self.alt),
+            alt_machiaza=tuple(self.alt_machiaza),
         )
 
 
-class TownTable:
-    """町字の行と (索引鍵, town_id) の組を溜める。"""
+class MachiazaTable:
+    """町字の行と (索引鍵, row_id) の組を溜める。"""
 
     def __init__(self) -> None:
         self._rows: list[_Row] = []
@@ -98,19 +92,19 @@ class TownTable:
         self._geolonia_merged = 0
 
     @property
-    def records(self) -> list[TownRecord]:
+    def records(self) -> list[MachiazaRecord]:
         return [row.to_record() for row in self._rows]
 
     @property
     def pairs(self) -> list[tuple[str, int]]:
-        """(索引鍵, town_id)。同じ鍵が複数の町字を指すことはある（同名の町字）。"""
+        """(索引鍵, row_id)。同じ鍵が複数の町字を指すことはある（同名の町字）。"""
         return self._pairs
 
     @property
-    def stats(self) -> TownStats:
-        return TownStats(
+    def stats(self) -> MachiazaStats:
+        return MachiazaStats(
             towns=len(self._rows),
-            keys=len(self._pairs),
+            trie_keys=len(self._pairs),
             folded=self._folded,
             geolonia_added=self._geolonia_added,
             geolonia_merged=self._geolonia_merged,
@@ -118,13 +112,13 @@ class TownTable:
 
     # ------------------------------------------------------------- ABR
 
-    def add_abr(self, rows: Iterable[TownRow]) -> None:
+    def add_abr(self, rows: Iterable[MachiazaRow]) -> None:
         for row in rows:
-            aliases = town_aliases(row.name)
+            aliases = machiaza_aliases(row.name)
             if not aliases:
                 continue
 
-            twin = self._by_machiaza.get(row.slot)
+            twin = self._by_machiaza.get(row.machiaza_key)
             if twin is not None:
                 # 同じ machiaza_id の 2 行目。行は足さない。
                 self._absorb(twin, row)
@@ -137,9 +131,9 @@ class TownTable:
                 # 地番は空間的に隣接していて番号帯だけが 1..11 と 42..101 に
                 # 割れていた。鳥取県の 88 組では片側の地番が 0 件（幽霊）。
                 # **両方の machiaza_id を持たせて層2 は両方引く。**
-                self._rows[twin].alt.append(row.machiaza_id)
+                self._rows[twin].alt_machiaza.append(row.machiaza_id)
                 self._absorb(twin, row)
-                self._by_machiaza[row.slot] = twin
+                self._by_machiaza[row.machiaza_key] = twin
                 self._grow(twin, aliases)
                 self._folded += 1
                 continue
@@ -152,10 +146,10 @@ class TownTable:
                 rsdt_addr_flg=row.rsdt_addr_flg,
                 point=row.point,
             )
-            self._by_machiaza[row.slot] = index
+            self._by_machiaza[row.machiaza_key] = index
             self._by_place[place] = index
 
-    def _absorb(self, index: int, row: TownRow) -> None:
+    def _absorb(self, index: int, row: MachiazaRow) -> None:
         """畳む先に、行を足さずに属性だけ取り込む。
 
         住居表示がある側の ``rsdt_addr_flg`` を採る。番号の取得は
@@ -184,9 +178,9 @@ class TownTable:
         by_place: dict[str, int] = {}
         cities: dict[str, tuple[int, CityName]] = {}
         for row in self._rows:
-            city = _city_text(row.name)
+            city = row.name.city_text
             name = row.name
-            by_place.setdefault(match_key(city, name.oaza_cho, name.chome, name.koaza), row.town_id)
+            by_place.setdefault(match_key(city, name.oaza_cho, name.chome, name.koaza), row.row_id)
             # geolonia は市区町村コードを持つが ABR の lg_code とは桁が違うので
             # 名前で引く。
             cities.setdefault(match_key(city), (row.lg_code, name.city_name))
@@ -196,7 +190,7 @@ class TownTable:
             if found is None:
                 continue
             lg_code, city = found
-            name = TownName(
+            name = MachiazaName(
                 pref=city.pref,
                 county=city.county,
                 city=city.city,
@@ -206,7 +200,7 @@ class TownTable:
                 chome_number="",
                 koaza=town.koaza,
             )
-            aliases = town_aliases(name)
+            aliases = machiaza_aliases(name)
             if not aliases:
                 continue
 
@@ -240,7 +234,7 @@ class TownTable:
         self,
         lg_code: int,
         machiaza_id: int,
-        name: TownName,
+        name: MachiazaName,
         aliases: set[str],
         *,
         rsdt_addr_flg: int = 0,
@@ -250,7 +244,7 @@ class TownTable:
         index = len(self._rows)
         self._rows.append(
             _Row(
-                town_id=index,
+                row_id=index,
                 lg_code=lg_code,
                 machiaza_id=machiaza_id,
                 name=name,
@@ -267,17 +261,13 @@ class TownTable:
 
         畳んだ分だけしか作らないので、持ち歩く集合は小さい。
         """
-        already = self._grown.setdefault(index, town_aliases(self._rows[index].name))
+        already = self._grown.setdefault(index, machiaza_aliases(self._rows[index].name))
         self._pairs.extend((alias, index) for alias in aliases - already)
         already |= aliases
 
 
-def _place_of(lg_code: int, name: TownName) -> _Place:
+def _place_of(lg_code: int, name: MachiazaName) -> _Place:
     return (lg_code, without_prefix(name.oaza_cho), name.chome, without_prefix(name.koaza))
-
-
-def _city_text(name: TownName) -> str:
-    return f"{name.pref}{name.county}{name.city}{name.ward}"
 
 
 def _point_of(town: GeoloniaTown) -> Point | None:

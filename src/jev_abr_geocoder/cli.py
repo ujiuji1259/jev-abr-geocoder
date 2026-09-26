@@ -23,7 +23,7 @@ from . import adapters, ports
 from ._version import __version__
 from .config import GeocoderConfig
 from .geocoder import Geocoder
-from .models import GeocodeResult
+from .outcome import GeocodeResult
 
 app = typer.Typer(
     add_completion=False,
@@ -90,10 +90,10 @@ def build(
                 f"都道府県      : {report.prefs:,}",
                 f"市区町村      : {report.cities:,}",
                 f"町字          : {report.towns:,}  (索引鍵 {report.trie_keys:,})",
-                f"  ABR 内で畳んだ: {report.towns_folded:,}",
-                f"  うち Geolonia: {report.geolonia_towns:,} "
+                f"  ABR 内で畳んだ: {report.machiaza_folded:,}",
+                f"  うち Geolonia: {report.geolonia_added:,} "
                 f"(既存に畳んだ別名 {report.geolonia_merged:,})",
-                f"番号          : {report.numbers:,}",
+                f"番号          : {report.banchi:,}",
                 f"所要          : {report.elapsed:.1f} 秒",
             ]
             + [f"注記          : {note}" for note in report.notes]
@@ -113,14 +113,12 @@ def normalize(
     no_model: Annotated[
         bool, typer.Option("--no-model", help="Jev を呼ばず、トライの候補だけで判定する")
     ] = False,
-    always_rerank: Annotated[
-        bool, typer.Option("--always-rerank", help="ファストパスを無効化して常に Jev を通す")
+    always_ask: Annotated[
+        bool, typer.Option("--always-ask", help="ファストパスを無効化して常に Jev を通す")
     ] = False,
 ) -> None:
     """住所を正規化する。"""
-    cfg = GeocoderConfig(
-        batch_size=batch_size, concurrency=concurrency, always_rerank=always_rerank
-    )
+    cfg = GeocoderConfig(batch_size=batch_size, concurrency=concurrency, always_ask=always_ask)
     queries = list(address) if address else [line.strip() for line in sys.stdin if line.strip()]
     if not queries:
         raise typer.BadParameter("住所が指定されていない")
@@ -150,8 +148,8 @@ def info(data_dir: DataDir = _DEFAULT_DATA_DIR) -> None:
         for key in ("schema_version", "builder_version", "level", "built_at"):
             if key in meta:
                 lines.append(f"{key:12}: {meta[key]}")
-        lines.append(f"町字        : {store.town_count():,}")
-        lines.append(f"番号        : {store.number_count():,}")
+        lines.append(f"町字        : {store.machiaza_count():,}")
+        lines.append(f"番号        : {store.banchi_count():,}")
         lines.append(f"取り込み済み: {len(store.sources()):,} ファイル")
         if "geolonia_attribution" in meta:
             lines.append("")
@@ -173,7 +171,7 @@ def _open_model(cfg: GeocoderConfig) -> ports.DecisionModel | None:
 
 def _human(result: GeocodeResult) -> str:
     head = result.address or "(解決できず)"
-    bits = [f"{result.query}  ->  {head}", f"  粒度      : {result.level.label}"]
+    bits = [f"{result.query}  ->  {head}", f"  粒度      : {result.granularity.label}"]
     if result.lat is not None and result.lon is not None:
         bits.append(f"  座標      : {result.lat:.6f}, {result.lon:.6f}")
     codes = [
@@ -186,8 +184,8 @@ def _human(result: GeocodeResult) -> str:
     filled = [f"{name}={value}" for name, value in codes if value]
     if filled:
         bits.append("  ABR       : " + " ".join(filled))
-    if result.rest:
-        bits.append(f"  残り      : {result.rest}")
+    if result.remainder:
+        bits.append(f"  残り      : {result.remainder}")
     bits.append(f"  確信度    : {result.confidence:.2f}  resolved={result.resolved}")
     if result.note:
         bits.append(f"  注記      : {result.note}")

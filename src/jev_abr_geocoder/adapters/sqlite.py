@@ -17,12 +17,20 @@ from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
-from ..index import numblob
-from ..models import CityRecord, NumberEntry, NumberKind, Point, PrefRecord, TownRecord
+from ..address import (
+    Banchi,
+    BanchiKind,
+    CityRecord,
+    MachiazaName,
+    MachiazaRecord,
+    Point,
+    PrefRecord,
+)
+from ..index import banchi_codec
 
 __all__ = ["SqliteStore", "SCHEMA_VERSION", "DB_FILENAME"]
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DB_FILENAME = "abr.db"
 
 _SCHEMA = """
@@ -58,9 +66,9 @@ CREATE TABLE IF NOT EXISTS city(
     lon_1e7 INTEGER
 );
 
--- town_id は前方一致トライのペイロードと一致する。
-CREATE TABLE IF NOT EXISTS town(
-    town_id       INTEGER PRIMARY KEY,
+-- row_id は前方一致トライのペイロードと一致する。
+CREATE TABLE IF NOT EXISTS machiaza(
+    row_id       INTEGER PRIMARY KEY,
     lg_code       INTEGER NOT NULL,
     machiaza_id   INTEGER NOT NULL,
     pref          TEXT NOT NULL,
@@ -84,9 +92,9 @@ CREATE TABLE IF NOT EXISTS town(
 -- 同じ町字を 2 行に分けない。mt_town は住居表示と地番の両方を持つ町字を
 -- rsdt_addr_flg 違いの 2 行で収録しているが、取り込み時に 1 行へまとめる。
 -- 分かれていると表示が同一の選択肢を Jev に見せることになり、答えようがない。
-CREATE UNIQUE INDEX IF NOT EXISTS town_by_machiaza ON town(lg_code, machiaza_id, source);
+CREATE UNIQUE INDEX IF NOT EXISTS machiaza_by_code ON machiaza(lg_code, machiaza_id, source);
 
--- 街区・住居番号・地番。町字単位でパックした BLOB（numblob.py の形式）。
+-- 街区・住居番号・地番。町字単位でパックした BLOB（banchi_codec.py の形式）。
 CREATE TABLE IF NOT EXISTS num_blob(
     lg_code     INTEGER NOT NULL,
     machiaza_id INTEGER NOT NULL,
@@ -116,6 +124,14 @@ class SqliteStore:
     @classmethod
     def open(cls, path: Path, *, readonly: bool = True) -> SqliteStore:
         if readonly:
+            found = _schema_version(path)
+            if found != SCHEMA_VERSION:
+                # 索引は ABR から何度でも組み直せるので移行は書かない。
+                # 黙って落ちるより、何をすればよいかを言う。
+                raise RuntimeError(
+                    f"索引の版が合わない (索引 {found} / このパッケージ {SCHEMA_VERSION})。"
+                    "build で作り直してください。"
+                )
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,22 +215,22 @@ class SqliteStore:
             ((r.lg_code, r.pref, r.county, r.city, r.ward, *_coords(r.point)) for r in records),
         )
 
-    def replace_towns(self, records: Iterable[TownRecord]) -> None:
-        self._conn.execute("DELETE FROM town")
+    def replace_machiaza(self, records: Iterable[MachiazaRecord]) -> None:
+        self._conn.execute("DELETE FROM machiaza")
         self._conn.executemany(
-            "INSERT INTO town VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO machiaza VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 (
-                    r.town_id,
+                    r.row_id,
                     r.lg_code,
                     r.machiaza_id,
-                    r.pref,
-                    r.county,
-                    r.city,
-                    r.ward,
-                    r.oaza_cho,
-                    r.chome,
-                    r.koaza,
+                    r.name.pref,
+                    r.name.county,
+                    r.name.city,
+                    r.name.ward,
+                    r.name.oaza_cho,
+                    r.name.chome,
+                    r.name.koaza,
                     r.rsdt_addr_flg,
                     *_coords(r.point),
                     r.source,
@@ -224,11 +240,9 @@ class SqliteStore:
             ),
         )
 
-    def put_numbers_many(
-        self, items: Iterable[tuple[int, int, NumberKind, Sequence[NumberEntry]]]
-    ) -> int:
+    def put_banchi(self, items: Iterable[tuple[int, int, BanchiKind, Sequence[Banchi]]]) -> int:
         rows = [
-            (lg, mz, int(kind), len(entries), numblob.encode(entries))
+            (lg, mz, int(kind), len(entries), banchi_codec.encode(entries))
             for lg, mz, kind, entries in items
             if entries
         ]
@@ -260,37 +274,37 @@ class SqliteStore:
             for r in self._conn.execute("SELECT * FROM city ORDER BY lg_code")
         ]
 
-    def towns(self, town_ids: Sequence[int]) -> dict[int, TownRecord]:
+    def machiaza(self, row_ids: Sequence[int]) -> dict[int, MachiazaRecord]:
         """町字を一括で引く。候補を絞ったあとにだけ呼ぶ。"""
-        if not town_ids:
+        if not row_ids:
             return {}
-        out: dict[int, TownRecord] = {}
+        out: dict[int, MachiazaRecord] = {}
         # SQLite の変数上限 (既定 999) を避けて分割する。
-        for chunk in _chunks(list(town_ids), 900):
+        for chunk in _chunks(list(row_ids), 900):
             placeholders = ",".join("?" * len(chunk))
             for row in self._conn.execute(
-                f"SELECT * FROM town WHERE town_id IN ({placeholders})", chunk
+                f"SELECT * FROM machiaza WHERE row_id IN ({placeholders})", chunk
             ):
                 record = _town_record(row)
-                out[record.town_id] = record
+                out[record.row_id] = record
         return out
 
-    def town_count(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) AS n FROM town").fetchone()
+    def machiaza_count(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM machiaza").fetchone()
         return int(row["n"])
 
-    def number_count(self) -> int:
+    def banchi_count(self) -> int:
         row = self._conn.execute("SELECT COALESCE(SUM(n), 0) AS n FROM num_blob").fetchone()
         return int(row["n"])
 
-    def fetch_numbers(
+    def fetch_banchi(
         self,
         lg_code: int,
         machiaza_id: int,
-        kind: NumberKind,
+        kind: BanchiKind,
         *,
         num1: int | None = None,
-    ) -> list[NumberEntry]:
+    ) -> list[Banchi]:
         """町字配下の番号を返す。
 
         ``num1`` を与えると目録で二分探索し、その番号を含むチャンクだけを展開する。
@@ -301,7 +315,7 @@ class SqliteStore:
         ).fetchone()
         if row is None:
             return []
-        return numblob.decode(bytes(row["data"]), num1=num1)
+        return banchi_codec.decode(bytes(row["data"]), num1=num1)
 
 
 _PUT_NUMBERS = (
@@ -326,30 +340,39 @@ def _schema_version(path: Path) -> int | None:
         conn.close()
 
 
+#: 座標を整数で持つ倍率。**層2 の BLOB と同じ値を使う** — 別にすると同じ
+#: ファイルの中で座標の精度が揃わなくなる。
+_SCALE = banchi_codec.COORD_SCALE
+
+
 def _point(lat_1e7: Any, lon_1e7: Any) -> Point | None:
     if lat_1e7 is None or lon_1e7 is None:
         return None
-    return Point(lat=int(lat_1e7) / numblob.COORD_SCALE, lon=int(lon_1e7) / numblob.COORD_SCALE)
+    return Point(lat=int(lat_1e7) / _SCALE, lon=int(lon_1e7) / _SCALE)
 
 
 def _coords(point: Point | None) -> tuple[int | None, int | None]:
     if point is None:
         return None, None
-    return round(point.lat * numblob.COORD_SCALE), round(point.lon * numblob.COORD_SCALE)
+    return round(point.lat * _SCALE), round(point.lon * _SCALE)
 
 
-def _town_record(row: sqlite3.Row) -> TownRecord:
-    return TownRecord(
-        town_id=int(row["town_id"]),
+def _town_record(row: sqlite3.Row) -> MachiazaRecord:
+    return MachiazaRecord(
+        row_id=int(row["row_id"]),
         lg_code=int(row["lg_code"]),
         machiaza_id=int(row["machiaza_id"]),
-        pref=str(row["pref"]),
-        county=str(row["county"]),
-        city=str(row["city"]),
-        ward=str(row["ward"]),
-        oaza_cho=str(row["oaza_cho"]),
-        chome=str(row["chome"]),
-        koaza=str(row["koaza"]),
+        name=MachiazaName(
+            pref=str(row["pref"]),
+            county=str(row["county"]),
+            city=str(row["city"]),
+            ward=str(row["ward"]),
+            oaza_cho=str(row["oaza_cho"]),
+            chome=str(row["chome"]),
+            # 鍵を作るのにだけ要る列なので永続化していない。読み戻しでは空。
+            chome_number="",
+            koaza=str(row["koaza"]),
+        ),
         rsdt_addr_flg=int(row["rsdt_addr_flg"]),
         point=_point(row["lat_1e7"], row["lon_1e7"]),
         source=str(row["source"]),

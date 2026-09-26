@@ -40,8 +40,10 @@ TypeSafe のドキュメントが「人間がレビューすべきは質問と�
 
 ```
 src/jev_abr_geocoder/
-├── __init__.py          公開 API: Geocoder, GeocodeResult, Level, GeocoderConfig, ports
-├── models.py            値型（ABR のレコードと名前は frozen）
+├── __init__.py          公開 API: Geocoder, GeocodeResult, Granularity, GeocoderConfig, ports
+├── address.py           住所の値型（表記・レコード・粒度）。すべて frozen
+├── decision.py          判定モデルの答えと使用量
+├── outcome.py           出力の値型（GeocodeResult, BatchOutcome）。ここだけ可変
 ├── ports.py             ★ 外部依存の境界の唯一の置き場（Protocol と境界の値型）
 ├── config.py            ★ 質問文と閾値の唯一の置き場
 ├── textnorm.py          NFKC + 空白除去。これだけ
@@ -49,7 +51,7 @@ src/jev_abr_geocoder/
 ├── adapters/            ★ 外部ライブラリを触る唯一の場所
 │   ├── __init__.py      既定の組み合わせ（合成の根）
 │   ├── sqlite.py        IndexReader / IndexWriter  ← sqlite3
-│   ├── marisa.py        PrefixTrie / TrieFactory   ← marisa-trie
+│   ├── marisa.py        PrefixTrie / TrieBackend   ← marisa-trie
 │   ├── jev.py           DecisionModel              ← typesafe-sdk
 │   └── http.py          HttpClient                 ← httpx
 │
@@ -62,16 +64,16 @@ src/jev_abr_geocoder/
 │
 ├── index/               索引（判定モデルも永続化の実装も知らない）
 │   ├── keys.py          ★ 表記ゆれの知識の唯一の置き場（索引鍵と突き合わせ鍵）
-│   ├── townindex.py     層1 読み取り: 前方一致トライ + 市区町村索引
-│   ├── towntable.py     層1 構築: 同じ場所の畳み込みと Geolonia 補完
-│   ├── numblob.py       層2 バイナリ仕様: エンコード / デコード
-│   └── build.py         構築オーケストレーション（再開可能）
+│   ├── machiaza_index.py  層1 読み取り: 前方一致トライ + 市区町村索引
+│   ├── machiaza_table.py  層1 構築: 同じ場所の畳み込みと Geolonia 補完
+│   ├── banchi_codec.py    層2 バイナリ仕様: エンコード / デコード
+│   └── build.py           構築オーケストレーション（再開可能）
 │
 ├── match/               候補生成と判定
-│   ├── candidates.py    層1 の候補生成（完全一致 2 方向。曖昧一致なし）
-│   ├── tail.py          数値テール抽出
-│   ├── numbers.py       層2 の候補取得と絞り込み
-│   └── rerank.py        問いの組み立てと答えの解釈（Jev の形は知らない）
+│   ├── candidates.py    層1 の候補生成（完全一致 2 方向。曖昧一致なし）と候補の型
+│   ├── banchi_tail.py   入力側の番地部分から数値列を取る
+│   ├── banchi.py        層2 の候補取得と絞り込み（ABR 側）
+│   └── choose.py        問いの組み立てと答えの解釈（Jev の形は知らない）
 │
 ├── assemble.py          閾値ゲートと結果の組み立て
 ├── geocoder.py          段取り（どの段をどの順に走らせるか）
@@ -80,21 +82,57 @@ src/jev_abr_geocoder/
 
 依存方向は上から下への一方向。`index/` は `match/` を知らず、`abr/` は索引の構造を知らない。`geocoder.py` だけが全部を知る。
 
-`adapters/` だけはこの向きの外にあり、**内側（`ports.py` と `models.py`）にだけ依存する**。コア側から `adapters/` を import するのは合成の根（`Geocoder.open` と `build()`）の関数内だけで、モジュール先頭には出てこない。
+`adapters/` だけはこの向きの外にあり、**内側（`ports.py` と値型）にだけ依存する**。コア側から `adapters/` を import するのは合成の根（`Geocoder.open` と `build()`）の関数内だけで、モジュール先頭には出てこない。
+
+### 語彙
+
+**型の名前は ABR の語彙に合わせる。** 列名がすでに `machiaza_id` / `oaza_cho` / `koaza` / `chome` / `rsdt_addr_flg` とローマ字なので、型もそれに揃える。
+
+| 層 | 採った語 | 避けた語 | 理由 |
+|---|---|---|---|
+| 町字 | `Machiaza*` | `Town*` | ABR の `mt_city` には 郡・市・区・**町**・村 が入る。英語にすると 町村 と 町字 がどちらも "town" になり、層が混ざる |
+| 街区・住居番号・地番 | `Banchi*` | `Number*` | ABR に "number" マスターは無い。3 体系の総称が要るだけなので日常語の「番地」を借りる。"number" は件数でも ID でも通るので何も言っていない |
+
+接尾辞も層を表す。同じ町字が層ごとに別の型になるので、名前で層が読めないと追えなくなる。
+
+| 接尾辞 | 意味 | 例 |
+|---|---|---|
+| `*Row` | ABR の CSV 1 行 | `MachiazaRow`, `BanchiRow` |
+| `*Record` | 索引に入っている実体 | `MachiazaRecord`, `CityRecord` |
+| `*Name` | その粒度を一意に指す表記のすべて | `MachiazaName`, `CityName` |
+| `*Candidate` / `*Candidates` | まだ選ばれていないもの | `MachiazaCandidate`, `BanchiCandidates` |
+
+`*Name` が「表記のすべて」なのは、町字を指すには市区町村が要り、市区町村を指すには都道府県が要るから。`CityName` が `pref` を持つのと同じ理由で `MachiazaName` は市区町村まで持つ。**住所の文字列を組み立てるのはこの 2 つだけの仕事**で、`MachiazaRecord` は `name` を部品として持つ（列を平らに並べると組み立てが 2 箇所に分かれる）。
+
+`row_id` は索引の中での通し番号で、ABR の `machiaza_id` とは別物。前方一致トライのペイロードと一致する。
+
+**実装が変わって嘘になった名前は残さない。** 以下は過去の実装の痕跡だったもの。
+
+| 捨てた語 | 採った語 | 理由 |
+|---|---|---|
+| `beam*`（7 箇所） | `narrow_*` / `needs_narrowing` / `OAZA_QUESTION` | ビームサーチではない。実体は「候補が多すぎるとき先に大字で絞る」 |
+| `Reranker` / `rerank.py` / `always_rerank` | `Chooser` / `choose.py` / `always_ask` | 並べ替えはしていない。候補から 1 つ選ばせるだけ |
+| `Level` | `Granularity` | CLI も docs も「粒度」と呼んでいた。`BuildLevel`（構築の深さ）とも紛れる |
+| `Tail` | `BanchiTail` | 「テール」はこのコードの造語。入力側の番地部分であることを名前に出す |
+| `PrefixTrie.prefixes` / `under` | `prefixes_of` / `extensions_of` | どちらが接頭辞なのか名前から読めなかった |
+| `MachiazaIndex.store` | `reader` | 読み取り専用なのに Store |
+| `*Hit` | `*Match` | Hit は DB 用語 |
+| `GeocodeResult.rest` | `remainder` | 候補側は `remainder` で不統一だった |
+| `CandidateSet.exact` / `exhausted` | `prefix_matched` / `ends_at` | 形容詞・過去分詞のままでは何の話か分からない |
 
 ---
 
-## 3. 層1: `town.marisa` + `abr.db` の `town` テーブル
+## 3. 層1: `machiaza.marisa` + `abr.db` の `machiaza` テーブル
 
-トライのペイロードは町字レコードへのインデックス (`<I`) だけを持つ。表示用の住所文字列と座標は `abr.db` の `town` テーブルに置く。
+トライのペイロードは町字レコードへのインデックス (`<I`) だけを持つ。表示用の住所文字列と座標は `abr.db` の `machiaza` テーブルに置く。
 
 **理由**: 鍵は 5.14M 本あるが町字は 727k 件しかないので、トライにレコードを埋め込むと 7.1 倍冗長になる。また、トライの鍵は NFKC 正規化後のエイリアスであり、**出力に使うべき ABR の正規表記そのものではない**（「鳥取県鳥取市面影1丁目」ではなく「鳥取県鳥取市面影一丁目」を返したい）。
 
-### `town` テーブル
+### `machiaza` テーブル
 
 ```sql
-CREATE TABLE town(
-  town_id      INTEGER PRIMARY KEY,   -- トライのペイロードと一致
+CREATE TABLE machiaza(
+  row_id      INTEGER PRIMARY KEY,   -- トライのペイロードと一致
   lg_code      INTEGER NOT NULL,
   machiaza_id  INTEGER NOT NULL,
   pref         TEXT, county TEXT, city TEXT, ward TEXT,
@@ -102,62 +140,62 @@ CREATE TABLE town(
   rsdt_addr_flg INTEGER NOT NULL,
   lat_1e7      INTEGER, lon_1e7 INTEGER
 );
-CREATE INDEX town_by_city ON town(lg_code, machiaza_id);
+CREATE UNIQUE INDEX machiaza_by_code ON machiaza(lg_code, machiaza_id, source);
 ```
 
-全国で約 61 MB（`abr.db` 全体、層2 を除く）。`town_id` は `INTEGER PRIMARY KEY`（= rowid のエイリアス）なので、トライが返す ID からの引きは B-tree の直接引きになる。
+全国で約 61 MB（`abr.db` 全体、層2 を除く）。`row_id` は `INTEGER PRIMARY KEY`（= rowid のエイリアス）なので、トライが返す ID からの引きは B-tree の直接引きになる。
 
 行を引くのは**候補を 255 件に絞ったあと**だけなので、1 クエリあたり高々数百行。行デコードのコストは Jev の往復（70〜500 ms）に対して無視できる。
 
-> mmap した固定長レコード配列（約 57 MB、ワーカー間でページキャッシュ共有）も検討したが、**構築と実装の単純さを優先して SQLite を採る**。層2 と同じ 1 ファイルに収まるので、配布物が `town.marisa` と `abr.db` の 2 つだけになる利点もある。
+> mmap した固定長レコード配列（約 57 MB、ワーカー間でページキャッシュ共有）も検討したが、**構築と実装の単純さを優先して SQLite を採る**。層2 と同じ 1 ファイルに収まるので、配布物が `machiaza.marisa` と `abr.db` の 2 つだけになる利点もある。
 
 ### インターフェース
 
 ```python
-class TownIndex:
+class MachiazaIndex:
     """読み取り専用。プロセス間で安全に共有できる。"""
 
-    def __init__(self, trie: PrefixTrie, store: IndexReader, *, tries: TrieFactory) -> None:
+    def __init__(self, trie: PrefixTrie, reader: IndexReader, *, backend: TrieBackend) -> None:
         """トライも永続化もポートで受け取る。開くのは adapters.open_index。"""
 
-    def prefixes(self, text: str) -> list[TownHit]:
+    def prefixes(self, text: str) -> list[MachiazaHit]:
         """text の前方一致鍵をすべて返す。長い順。"""
 
-    def keys_under(self, prefix: str, limit: int) -> list[tuple[str, int]]:
-        """prefix 配下の (鍵, town_id)。丁目・小字の省略を拾う母集合。"""
+    def machiaza_extensions(self, prefix: str, limit: int) -> list[tuple[str, int]]:
+        """prefix 配下の (鍵, row_id)。丁目・小字の省略を拾う母集合。"""
 
     def city_prefixes(self, text: str) -> list[CityHit]: ...
     def pref_prefix(self, text: str) -> tuple[PrefRecord, str] | None: ...
 
     @property
-    def store(self) -> IndexReader:
+    def reader(self) -> IndexReader:
         """町字レコードと層2 の番号を引く先。"""
 ```
 
-`trie` と `store` は `ports.py` の Protocol で、実体は `adapters/marisa.py` と `adapters/sqlite.py`。`TownIndex` が mmap の有無も SQL も知らないので、別バックエンド（mmap した固定長レコード配列など）に差し替えるならアダプタを1つ足すだけで済む。
+`trie` と `reader` は `ports.py` の Protocol で、実体は `adapters/marisa.py` と `adapters/sqlite.py`。`MachiazaIndex` が mmap の有無も SQL も知らないので、別バックエンド（mmap した固定長レコード配列など）に差し替えるならアダプタを1つ足すだけで済む。
 
-`TownHit` は `(town_id: int, matched_len: int)` の軽量タプル。`TownRecord` への変換は必要になってから行う（候補を 255 件に絞ったあとでよい）。
+`MachiazaMatch` は `(row_id: int, matched_len: int)` の軽量タプル。`MachiazaRecord` への変換は必要になってから行う（候補を 255 件に絞ったあとでよい）。
 
 ---
 
 ## 4. 層2: `abr.db`
 
 ```python
-class NumberKind(IntEnum):
+class BanchiKind(IntEnum):
     BLOCK = 1
     RSDT = 2
     PARCEL = 3
 
 
 class IndexReader(Protocol):  # ports.py。実装は adapters/sqlite.py
-    def fetch_numbers(
+    def fetch_banchi(
         self,
         lg_code: int,
         machiaza_id: int,
-        kind: NumberKind,
+        kind: BanchiKind,
         *,
         num1: int | None = None,
-    ) -> list[NumberEntry]:
+    ) -> list[Banchi]:
         """町字配下の番号を返す。
 
         num1 を与えるとチャンク目録で二分探索し、その番号を含む
@@ -167,18 +205,18 @@ class IndexReader(Protocol):  # ports.py。実装は adapters/sqlite.py
 
 ```python
 @dataclass(frozen=True, slots=True)
-class NumberEntry:
+class Banchi:
     num1: int  # blk_num / blk_num  / prc_num1
     num2: int  # -       / rsdt_num / prc_num2
     num3: int  # -       / rsdt_num2 / prc_num3
     point: Point | None
 ```
 
-`blk_id` / `rsdt_id` / `prc_id` は番号のゼロ詰めであることを実測で確認済みなので格納せず、出力時に `models.py` のヘルパで復元する。
+`blk_id` / `rsdt_id` / `prc_id` は番号のゼロ詰めであることを実測で確認済みなので格納せず、出力時に `address.py` のヘルパで復元する。
 
-`numblob.py` は `encode(entries) -> bytes` と `decode(blob, num1=None) -> list[NumberEntry]` の純関数2本だけを公開する。SQLite を知らないので、エンコード・デコードのラウンドトリップテストが単体で書ける（呼ぶのはアダプタ側）。
+`banchi_codec.py` は `encode(entries) -> bytes` と `decode(blob, num1=None) -> list[Banchi]` の純関数2本だけを公開する。SQLite を知らないので、エンコード・デコードのラウンドトリップテストが単体で書ける（呼ぶのはアダプタ側）。
 
-書き込み側は `IndexWriter`（`replace_prefs` / `replace_cities` / `replace_towns` / `put_numbers_many` / `mark_source`）で、**出入りするのは `models.py` の値型だけ**。カラム順や `alt_machiaza` のカンマ区切りは `adapters/sqlite.py` の内側にあり、`build.py` は知らない。
+書き込み側は `IndexWriter`（`replace_prefs` / `replace_cities` / `replace_machiaza` / `put_banchi` / `mark_source`）で、**出入りするのは `address.py` の値型だけ**。カラム順や `alt_machiaza` のカンマ区切りは `adapters/sqlite.py` の内側にあり、`build.py` は知らない。
 
 ---
 
@@ -186,8 +224,8 @@ class NumberEntry:
 
 ```python
 @dataclass(frozen=True, slots=True)
-class TownCandidate:
-    town_id: int
+class MachiazaCandidate:
+    row_id: int
     matched: str  # 入力のうち消費した部分
     remainder: str  # 残り（数値テール + 建物名）
     # スコアは持たない。並び順がそのまま順位
@@ -195,7 +233,7 @@ class TownCandidate:
 
 ```python
 class CandidateFinder:
-    def __init__(self, index: TownIndex, cfg: GeocoderConfig): ...
+    def __init__(self, index: MachiazaIndex, cfg: GeocoderConfig): ...
 
     def find(self, normalized: str) -> CandidateSet:
         """候補を最大 cfg.max_options 件返す。
@@ -209,7 +247,7 @@ class CandidateFinder:
 
 1. `index.prefixes(normalized)` — 索引鍵が入力の先頭。5.3 µs。99.6% はここで決まる
 2. 入力が市区町村・都道府県ちょうどで終わっていないか
-3. `index.keys_under(stem)` — 入力が索引鍵の先頭（丁目・小字の省略）。末尾の番地を削ってからも試す
+3. `index.machiaza_extensions(stem)` — 入力が索引鍵の先頭（丁目・小字の省略）。末尾の番地を削ってからも試す
 4. どれも当たらなければ市区町村の粒度で返す
 
 **編集距離は持たない。** 実測で再現率 44%、全件のレイテンシ 25 倍、候補集合にノイズ、と割に合わなかった（[architecture.md](architecture.md) 参照）。
@@ -218,7 +256,7 @@ class CandidateFinder:
 
 ---
 
-## 6. 判定モデルの呼び出し `match/rerank.py` と `adapters/jev.py`
+## 6. 判定モデルの呼び出し `match/choose.py` と `adapters/jev.py`
 
 ### 差し替え可能にする
 
@@ -233,10 +271,10 @@ class Question:  # ports.py
 
 
 class DecisionModel(Protocol):
-    async def choose(self, questions: Sequence[Question]) -> ChoiceSet: ...
+    async def choose(self, questions: Sequence[Question]) -> Answers: ...
 ```
 
-**ポートの語彙は Jev を知らない。** `Choice` の組み立て、`__none__` の予約オプション、`c{i}` というオプション ID、255 件の上限、確率分布の読み取りは、すべて `adapters/jev.py` の内側にある。`rerank.py` に残るのは「どの候補をどう並べて訊くか」だけ。
+**ポートの語彙は Jev を知らない。** `Choice` の組み立て、`__none__` の予約オプション、`c{i}` というオプション ID、255 件の上限、確率分布の読み取りは、すべて `adapters/jev.py` の内側にある。`choose.py` に残るのは「どの候補をどう並べて訊くか」だけ。
 
 実装は `typesafe-sdk` の `AsyncTypeSafeClient` を包んだ `JevModel`。テストでは `FakeModel` を差し込む。**これがテスト可能性の要**で、これがないと Jev なしでは何も検証できなくなる。ポートをこの高さに切ってあるので、`FakeModel` は「何番目の選択肢を選ぶか」を答えるだけでよく、Jev の応答の形を模す必要がない。
 
@@ -258,7 +296,7 @@ questions = {
 }
 ```
 
-**同じ材料は `state` に1つしか置かない。** 分割絞り込み (beam) は1つの入力について何十問も並べるので、材料を問ごとに複製するとトークンがそのぶん嵩む。
+**同じ材料は `state` に1つしか置かない。** 分割絞り込み は1つの入力について何十問も並べるので、材料を問ごとに複製するとトークンがそのぶん嵩む。
 
 Choice の criteria は **最大 255 オプション**。候補がそれを超える場合は並び順の後ろから切る。
 
@@ -278,7 +316,7 @@ class Decision:
 
 `Decision.fast()` / `unverified()` / `unanswered()` の3つが定型で、ファストパス・候補の先頭への退避・答えなしをそれぞれ表す。
 
-`rerank.py` は候補リストと `Decision` の対応づけまでを担い、**閾値との比較はしない**。判断は `geocoder.py` が `config.py` の閾値を見て行う。
+`choose.py` は候補リストと `Decision` の対応づけまでを担い、**閾値との比較はしない**。判断は `geocoder.py` が `config.py` の閾値を見て行う。
 
 ### 劣化時の挙動
 
@@ -294,7 +332,7 @@ class Decision:
 class Geocoder:
     def __init__(
         self,
-        index: TownIndex,
+        index: MachiazaIndex,
         model: DecisionModel | None,
         cfg: GeocoderConfig,
     ) -> None: ...
@@ -322,15 +360,15 @@ class Geocoder:
 2. 候補生成        CandidateFinder.find()               mmap のみ、IO なし
 3. 分岐            最長一致が一意 → ファストパス / 競合・曖昧 → Jev へ
 4. Jev 往復 ①     町字確定（バッチ全体を1リクエスト）
-5. 番号取得        Store.fetch_numbers()                確定した町字だけ、1件1ブロブ
+5. 番号取得        IndexReader.fetch_banchi()                確定した町字だけ、1件1ブロブ
 6. 分岐            テールが一意に一致 → ファストパス / それ以外 → Jev へ
 7. Jev 往復 ②     番号確定（1リクエスト）
 8. 組み立て        confidence ゲートを見て粒度を決める
 ```
 
-`geocoder.py` にあるのは**段取りだけ**。1 件分の途中状態は `assemble.Resolution` で、段が順に埋めていく。番号の引き方は `match/numbers.py`、閾値を見て粒度を決めるのは `assemble.build()` にあり、`geocoder.py` は「どの段をどの順に走らせ、結果をどこへ書くか」しか知らない。
+`geocoder.py` にあるのは**段取りだけ**。1 件分の途中状態は `assemble.Resolution` で、段が順に埋めていく。番号の引き方は `match/banchi.py`、閾値を見て粒度を決めるのは `assemble.build()` にあり、`geocoder.py` は「どの段をどの順に走らせ、結果をどこへ書くか」しか知らない。
 
-**ファストパスが全件で効けば Jev 往復は 0 回。** geolonia の難例 7,191 件では 99.1% がここで決まり、Jev に回るのは 0.9% だった。`cfg.always_rerank` で無効化し、Jev 経路の精度を評価できるようにする。
+**ファストパスが全件で効けば Jev 往復は 0 回。** geolonia の難例 7,191 件では 99.1% がここで決まり、Jev に回るのは 0.9% だった。`cfg.always_ask` で無効化し、Jev 経路の精度を評価できるようにする。
 
 ### confidence ゲート
 
@@ -366,14 +404,14 @@ async def build(
 `build.py` にあるのは段取りだけで、中身は 2 つに分かれている。
 
 - `abr/rows.py` — **ABR の CSV の列名を知っている唯一の場所。** `machiaza_id` / `prc_id` / `rep_lat` といった列の名前と意味、状態フラグ 3 の除外、いろは地番を `prc_id` から復元する規則がここに閉じる。外へは値型で渡す
-- `index/towntable.py` — **同じ場所を指す行の畳み込み。** 住居表示と地番の 2 行 (1,248 組)、字あり/なしの 2 行 (3,816 組)、Geolonia の別表記 (50,267 件) を 1 行にまとめ、鍵だけを足す。畳み忘れると判定モデルに見分けのつかない選択肢を見せることになるので、`tests/test_towntable.py` で 3 つの型すべてを固定している
+- `index/machiaza_table.py` — **同じ場所を指す行の畳み込み。** 住居表示と地番の 2 行 (1,248 組)、字あり/なしの 2 行 (3,816 組)、Geolonia の別表記 (50,267 件) を 1 行にまとめ、鍵だけを足す。畳み忘れると判定モデルに見分けのつかない選択肢を見せることになるので、`tests/test_machiaza_table.py` で 3 つの型すべてを固定している
 
 `abr.db` の `meta` テーブルに、取り込み済みソースファイルの URL と `Last-Modified` を記録する。再実行時は
 
 - 未取り込み、または `Last-Modified` が変わったファイルだけを処理する
 - これがそのまま**差分更新**になる（ABR は定期更新されるため）
 
-層1 (`town.marisa` と `town` テーブル) は全国一括ファイル1本から作るので、毎回作り直す（4 秒）。**一時ファイルに書いてから atomic rename する**ので、サーバが読んでいる最中に構築しても壊れない。
+層1 (`machiaza.marisa` と `machiaza` テーブル) は全国一括ファイル1本から作るので、毎回作り直す（4 秒）。**一時ファイルに書いてから atomic rename する**ので、サーバが読んでいる最中に構築しても壊れない。
 
 ### CLI
 
@@ -394,15 +432,15 @@ jev-abr-geocoder info                                   # 索引の版・件数�
 @dataclass(frozen=True)
 class GeocoderConfig:
     # --- 閾値 ---
-    town_confidence: float = 0.70
-    number_confidence: float = 0.60
+    machiaza_confidence: float = 0.70
+    banchi_confidence: float = 0.60
     present_threshold: float = 0.50  # __none__ 以外の確率の合計の下限
 
     # --- 候補生成 ---
     max_options: int = 255  # Jev Choice のオプション上限
 
     # --- 挙動 ---
-    always_rerank: bool = False  # ファストパスを無効化（評価用）
+    always_ask: bool = False  # ファストパスを無効化（評価用）
     batch_size: int = 64
     model: str = "jev-latest"
 
@@ -424,10 +462,10 @@ CONTAINS_ANSWER_INSTRUCTIONS = "..."
 | `textnorm` | 表駆動の純関数テスト | 不要 |
 | `ports` | 境界の値型（ヘッダの大小文字、304 の扱い） | 不要 |
 | `index/keys` | エイリアス生成規則と突き合わせ鍵の表テスト | 不要 |
-| `index/towntable` | 畳み込みの 3 つの型を合成データで | 不要 |
+| `index/machiaza_table` | 畳み込みの 3 つの型を合成データで | 不要 |
 | `abr/geolonia` | 偽の HttpClient で取得と読み | 不要 |
 | `match/numbers` | 番号体系の落とし方を偽の索引で | 不要 |
-| `index/numblob` | encode → decode ラウンドトリップ | 不要 |
+| `index/banchi_codec` | encode → decode ラウンドトリップ | 不要 |
 | `adapters/sqlite` | 一時 DB に小さなデータを入れて往復（`conftest` の索引がそれ） | 不要 |
 | `adapters/jev` | 偽クライアントで Choice の組み立てと応答解釈を検証 | 実装側を検証 |
 | `match/candidates` | 鳥取県だけの小さな索引を固定データから構築 | 不要 |

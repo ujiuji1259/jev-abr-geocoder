@@ -7,7 +7,7 @@
 単数形の専用経路を持たない。単数経路があると「1 件ずつループで呼ぶ」が自然に
 書けてしまい、10 倍遅く 12 倍高くなる（docs/code-design.md 制約1）。
 
-ここにあるのは**段取りだけ**。何を訊くかは :mod:`match.rerank`、番号の引き方は
+ここにあるのは**段取りだけ**。何を訊くかは :mod:`match.choose`、番号の引き方は
 :mod:`match.numbers`、結果の組み立てと閾値ゲートは :mod:`assemble` にある。
 """
 
@@ -17,21 +17,20 @@ import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Generic, TypeVar
 
 from . import assemble, ports, textnorm
+from .address import MachiazaRecord
 from .assemble import Resolution
 from .config import GeocoderConfig
-from .index.townindex import TownIndex
-from .match import numbers
-from .match.candidates import CandidateFinder, group_by_display, group_by_oaza
-from .match.rerank import BeamAsk, NumberAsk, Reranker, TownAsk
-from .match.tail import parse_tail
-from .models import BatchOutcome, Decision, GeocodeResult, TownCandidate, TownRecord
+from .decision import Decision
+from .index.machiaza_index import MachiazaIndex
+from .match import banchi
+from .match.banchi_tail import parse_banchi_tail
+from .match.candidates import CandidateFinder, MachiazaCandidate, group_by_display, group_by_oaza
+from .match.choose import Chooser, banchi_question, machiaza_question, oaza_question
+from .outcome import BatchOutcome, GeocodeResult
 
 __all__ = ["Geocoder", "AUTO_MODEL"]
-
-_Ask = TypeVar("_Ask")
 
 
 class _AutoModel:
@@ -49,28 +48,28 @@ AUTO_MODEL = _AutoModel()
 
 
 @dataclass(slots=True)
-class _Pending(Generic[_Ask]):
+class _Pending:
     """判定モデルに投げる 1 問と、その答えを書き戻す先。
 
     問と宛先を別々の平行リストで持つと、片方にだけ足す退行が静かに起きる。
     1 つの型にまとめて添字の対応づけを消す。
     """
 
-    ask: _Ask
+    question: ports.Question
     item: Resolution
     #: 町字の段では選択肢ごとにまとめた候補。番号の段では使わない。
-    groups: list[list[TownCandidate]] = field(default_factory=list)
+    groups: list[list[MachiazaCandidate]] = field(default_factory=list)
 
 
 class Geocoder:
     def __init__(
-        self, index: TownIndex, model: ports.DecisionModel | None, cfg: GeocoderConfig
+        self, index: MachiazaIndex, model: ports.DecisionModel | None, cfg: GeocoderConfig
     ) -> None:
         self._index = index
         self._cfg = cfg
         self._finder = CandidateFinder(index, cfg)
         self._model = model
-        self._reranker = Reranker(model, cfg) if model is not None else None
+        self._chooser = Chooser(model, cfg) if model is not None else None
 
     @classmethod
     def open(
@@ -153,7 +152,7 @@ class Geocoder:
     async def run(self, queries: Sequence[str]) -> BatchOutcome:
         """**1 バッチ**を処理し、結果と実行統計を返す。
 
-        ここが「入力が何件でも Jev の往復は高々 2 回（beam が要るときだけ 3 回）」
+        ここが「入力が何件でも Jev の往復は高々 2 回（分割絞り込みが要るときだけ 3 回）」
         を満たす単位。件数の多い入力は :meth:`run_all` で区切る。
         """
         outcome = BatchOutcome()
@@ -161,12 +160,12 @@ class Geocoder:
             return outcome
 
         items = [self._prepare(query) for query in queries]
-        records = self._load_town_records(items)
+        records = self._load_machiaza(items)
 
         await self._narrow(items, records, outcome)
-        await self._resolve_towns(items, records, outcome)
-        self._load_numbers(items)
-        await self._resolve_numbers(items, outcome)
+        await self._resolve_machiaza(items, records, outcome)
+        self._load_banchi(items)
+        await self._resolve_banchi(items, outcome)
 
         outcome.results = [assemble.build(item, self._index, self._cfg) for item in items]
         return outcome
@@ -181,15 +180,15 @@ class Geocoder:
             candidates=self._finder.find(normalized),
         )
 
-    def _load_town_records(self, items: Sequence[Resolution]) -> dict[int, TownRecord]:
+    def _load_machiaza(self, items: Sequence[Resolution]) -> dict[int, MachiazaRecord]:
         """バッチ全体の候補について町字レコードをまとめて引く。"""
-        town_ids = {c.town_id for item in items for c in item.candidates.candidates}
-        return self._index.store.towns(sorted(town_ids))
+        row_ids = {c.row_id for item in items for c in item.candidates.candidates}
+        return self._index.reader.machiaza(sorted(row_ids))
 
     async def _narrow(
         self,
         items: Sequence[Resolution],
-        records: dict[int, TownRecord],
+        records: dict[int, MachiazaRecord],
         outcome: BatchOutcome,
     ) -> None:
         """候補が Choice の上限を超えた入力だけ、先に大字を決めて絞る。
@@ -203,33 +202,33 @@ class Geocoder:
         **この段があるぶん、その入力だけは往復が 3 回になる。** 走るのは
         全体の 0.3% 程度なので、バッチ全体では 1 リクエスト増えるだけ。
         """
-        pending: list[_Pending[BeamAsk]] = []
+        pending: list[_Pending] = []
         for item in items:
-            if not item.candidates.needs_beam:
+            if not item.candidates.needs_narrowing:
                 continue
-            candidates = [c for c in item.candidates.candidates if c.town_id in records]
-            if not candidates or self._reranker is None:
+            candidates = [c for c in item.candidates.candidates if c.row_id in records]
+            if not candidates or self._chooser is None:
                 # 判定モデルが無いなら絞りようがない。粒度を落とす。
                 item.candidates = item.candidates.narrowed([])
                 continue
             groups = group_by_oaza(candidates, records)
             pending.append(
                 _Pending(
-                    ask=BeamAsk(
-                        query=item.query,
-                        normalized=item.normalized,
-                        options=[records[g[0].town_id].oaza_display for g in groups],
+                    question=oaza_question(
+                        item.query,
+                        item.normalized,
+                        [records[g[0].row_id].name.oaza_display for g in groups],
                     ),
                     item=item,
                     groups=groups,
                 )
             )
 
-        if not pending or self._reranker is None:
+        if not pending or self._chooser is None:
             return
-        result = await self._reranker.narrow([p.ask for p in pending])
+        result = await self._chooser.narrow([p.question for p in pending])
         outcome.usage.merge(result.usage)
-        outcome.beam_requests += result.usage.requests
+        outcome.narrow_requests += result.usage.requests
 
         for p, kept in zip(pending, result.survivors, strict=True):
             survivors = [c for i in kept if 0 <= i < len(p.groups) for c in p.groups[i]]
@@ -241,57 +240,50 @@ class Geocoder:
             # 組のうち 80 組）。次段が API 制限を破らないようここで収める。
             p.item.candidates = p.item.candidates.narrowed(survivors[: self._cfg.max_candidates])
 
-    async def _resolve_towns(
+    async def _resolve_machiaza(
         self,
         items: Sequence[Resolution],
-        records: dict[int, TownRecord],
+        records: dict[int, MachiazaRecord],
         outcome: BatchOutcome,
     ) -> None:
-        pending: list[_Pending[TownAsk]] = []
+        pending: list[_Pending] = []
         for item in items:
-            candidates = [c for c in item.candidates.candidates if c.town_id in records]
+            candidates = [c for c in item.candidates.candidates if c.row_id in records]
             if not candidates:
                 continue
-            if not self._cfg.always_rerank:
+            if not self._cfg.always_ask:
                 # 最長一致が一意なら選ぶ余地が無いので Jev を呼ばない。
                 # geolonia の難例 7,191 件では、これで Jev 送りが 12.2% から
                 # 0.9% に落ちる（同長の競合と曖昧一致だけが残る）。
                 unambiguous = item.candidates.unambiguous()
-                if unambiguous is not None and unambiguous.town_id in records:
+                if unambiguous is not None and unambiguous.row_id in records:
                     _accept(item, records, unambiguous, Decision.fast())
-                    outcome.town_fast_path += 1
+                    outcome.machiaza_fast_path += 1
                     continue
             groups = group_by_display(candidates, records)
             pending.append(
                 _Pending(
-                    ask=TownAsk(
-                        query=item.query,
-                        normalized=item.normalized,
-                        options=[records[g[0].town_id].display for g in groups],
+                    question=machiaza_question(
+                        item.query,
+                        item.normalized,
+                        [records[g[0].row_id].name.display for g in groups],
                     ),
                     item=item,
                     groups=groups,
                 )
             )
 
-        if not pending:
-            return
-        if self._reranker is None:
-            # モデルが無い（索引だけで動かしている）場合は候補の先頭。
+        decisions = await self._decide(
+            pending, outcome, unavailable="判定モデル未設定のため候補の先頭を採用"
+        )
+        if decisions is None:
+            # 訊けなかった。候補の先頭で代替する（理由は _decide が残している）。
             for p in pending:
-                _accept_top(p, records, "判定モデル未設定のため候補の先頭を採用")
+                _accept(p.item, records, p.groups[0][0], Decision.unverified())
             return
 
-        result = await self._reranker.pick_towns([p.ask for p in pending])
-        outcome.usage.merge(result.usage)
-        if not result.decisions:
-            # 答えが返らなかった。候補の先頭で代替する。
-            for p in pending:
-                _accept_top(p, records, _failure_note(result.failure))
-            return
-
-        for p, decision in zip(pending, result.decisions, strict=True):
-            p.item.town_decision = decision
+        for p, decision in zip(pending, decisions, strict=True):
+            p.item.machiaza_decision = decision
             if decision.index is None or not 0 <= decision.index < len(p.groups):
                 continue
             group = p.groups[decision.index]
@@ -301,31 +293,31 @@ class Geocoder:
                 # 決められない。代表の座標を返す。
                 p.item.remember(f"同名の町字が {len(group)} 件あり、座標は代表のもの")
 
-    def _load_numbers(self, items: Sequence[Resolution]) -> None:
+    def _load_banchi(self, items: Sequence[Resolution]) -> None:
         """確定した町字について層2 を引く。1 町字につき BLOB 1 本。"""
         for item in items:
-            town, tail = item.town, item.tail
-            if town is None or tail is None or not tail.numbers:
+            machiaza, tail = item.machiaza, item.tail
+            if machiaza is None or tail is None or not tail.numbers:
                 continue
-            if not town.from_abr:
+            if not machiaza.from_abr:
                 # Geolonia から補った町字は ABR の machiaza_id を持たないので、
                 # 層2（街区・住居番号・地番）を引けない。町字で止める。
                 continue
-            if not item.town_is_confident(self._cfg):
+            if not item.machiaza_is_confident(self._cfg):
                 continue
-            item.numbers = numbers.options_for(self._index.store, town, tail)
+            item.banchi = banchi.candidates_for(self._index.reader, machiaza, tail)
 
-    async def _resolve_numbers(self, items: Sequence[Resolution], outcome: BatchOutcome) -> None:
-        pending: list[_Pending[NumberAsk]] = []
+    async def _resolve_banchi(self, items: Sequence[Resolution], outcome: BatchOutcome) -> None:
+        pending: list[_Pending] = []
         for item in items:
-            options, tail, town = item.numbers, item.tail, item.town
-            if options is None or not options or tail is None or town is None:
+            options, tail, machiaza = item.banchi, item.tail, item.machiaza
+            if options is None or not options or tail is None or machiaza is None:
                 continue
-            options = numbers.ranked(options, tail.numbers, self._cfg.max_candidates)
-            item.numbers = options
-            exact = numbers.exact(options, tail.numbers)
+            options = banchi.ranked(options, tail.numbers, self._cfg.max_candidates)
+            item.banchi = options
+            exact = banchi.exact(options, tail.numbers)
 
-            if not exact and not self._cfg.always_rerank and not tail.skipped:
+            if not exact and not self._cfg.always_ask and not tail.skipped:
                 # **入力が候補の番号列の先頭になっている。** 「中砂見936番地」に
                 # 対し ABR は 936-1 / 936-2 / 936-3 しか持たない、という型。
                 # 親番は入力どおりで、枝番が分からないだけなので、Jev に
@@ -335,50 +327,68 @@ class Geocoder:
                 # 数字の手前を読み飛ばしている場合（ABR に無い小字が残って
                 # いる等）は町字の解釈が不完全なので、ここでは確定させずに
                 # Jev へ回す。
-                parents = numbers.parents(options, tail.numbers)
+                parents = banchi.parents(options, tail.numbers)
                 if parents:
-                    item.numbers = options.narrowed(parents)
-                    item.number_parent = True
-                    item.number_decision = Decision.fast()
-                    outcome.number_fast_path += 1
+                    item.banchi = options.narrowed(parents)
+                    item.banchi_parent = True
+                    item.banchi_decision = Decision.fast()
+                    outcome.banchi_fast_path += 1
                     continue
 
-            if len(exact) == 1 and not self._cfg.always_rerank:
+            if len(exact) == 1 and not self._cfg.always_ask:
                 # 入力の数値列が実在レコードと完全一致。選ぶ余地が無い。
-                item.numbers = options.narrowed(exact)
-                item.number_decision = Decision.fast()
-                outcome.number_fast_path += 1
+                item.banchi = options.narrowed(exact)
+                item.banchi_decision = Decision.fast()
+                outcome.banchi_fast_path += 1
                 continue
 
             pending.append(
                 _Pending(
-                    ask=NumberAsk(
-                        query=item.query,
-                        town=town.display,
-                        tail=tail.raw,
-                        kind=options.kind,
-                        options=[e.display for e in options.entries],
+                    question=banchi_question(
+                        item.query,
+                        machiaza.name.display,
+                        tail.raw,
+                        [e.display for e in options.entries],
                     ),
                     item=item,
                 )
             )
 
-        if not pending:
-            return
-        if self._reranker is None:
+        decisions = await self._decide(pending, outcome)
+        if decisions is None:
             for p in pending:
-                p.item.number_decision = Decision.unanswered()
+                p.item.banchi_decision = Decision.unanswered()
             return
+        for p, decision in zip(pending, decisions, strict=True):
+            p.item.banchi_decision = decision
 
-        result = await self._reranker.pick_numbers([p.ask for p in pending])
+    async def _decide(
+        self,
+        pending: Sequence[_Pending],
+        outcome: BatchOutcome,
+        *,
+        unavailable: str = "",
+    ) -> list[Decision] | None:
+        """溜めた問を投げ、答えを問と同じ順で返す。
+
+        **訊けなかったときは None を返す。** モデル未設定と、呼んだが答えが
+        返らなかった場合の両方がこれ。理由は :attr:`Resolution.note` に残すので、
+        呼び出し側は退避路（候補の先頭 / 答えなし）に落とすだけでよい。
+        段ごとに同じ分岐を書くと、片方で退避を書き忘れる退行が起きる。
+        """
+        if not pending:
+            return []
+        if self._chooser is None:
+            for p in pending:
+                p.item.remember(unavailable)
+            return None
+        result = await self._chooser.ask([p.question for p in pending])
         outcome.usage.merge(result.usage)
         if not result.decisions:
             for p in pending:
-                p.item.number_decision = Decision.unanswered()
                 p.item.remember(_failure_note(result.failure))
-            return
-        for p, decision in zip(pending, result.decisions, strict=True):
-            p.item.number_decision = decision
+            return None
+        return result.decisions
 
 
 # ------------------------------------------------------------------ 補助
@@ -386,24 +396,18 @@ class Geocoder:
 
 def _accept(
     item: Resolution,
-    records: dict[int, TownRecord],
-    candidate: TownCandidate,
+    records: dict[int, MachiazaRecord],
+    candidate: MachiazaCandidate,
     decision: Decision,
 ) -> None:
-    """町字を採る。残りは数値テールとして解釈する。"""
-    item.town = records[candidate.town_id]
-    item.tail = parse_tail(candidate.remainder)
-    item.town_decision = decision
+    """町字を採る。残りは数値テールとして解釈する。
 
-
-def _accept_top(p: _Pending[TownAsk], records: dict[int, TownRecord], note: str) -> None:
-    """候補の先頭（索引がいちばん近いと見たもの）を採る。
-
-    確信度 0 の :meth:`Decision.unverified` なので、:mod:`assemble` が粒度を
-    1 段上げて返す。**モデルの不調で例外を投げない**ための退避路。
+    ``Decision.unverified()`` で呼ぶと確信度 0 になり、:mod:`assemble` が
+    粒度を 1 段上げて返す。**モデルの不調で例外を投げない**ための退避路。
     """
-    _accept(p.item, records, p.groups[0][0], Decision.unverified())
-    p.item.remember(note)
+    item.machiaza = records[candidate.row_id]
+    item.tail = parse_banchi_tail(candidate.remainder)
+    item.machiaza_decision = decision
 
 
 def _failure_note(failure: str) -> str:

@@ -16,16 +16,16 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .. import ports
-from ..models import CityName, CityRecord, PrefRecord
+from ..address import CityName, CityRecord, PrefRecord
 from ..textnorm import normalize
 from .keys import city_aliases, pref_variants
 
-__all__ = ["TownIndex", "TownHit", "CityHit"]
+__all__ = ["MachiazaIndex", "MachiazaMatch", "CityMatch"]
 
 
 @dataclass(frozen=True, slots=True)
-class TownHit:
-    town_id: int
+class MachiazaMatch:
+    row_id: int
     #: 一致した索引鍵（正規化済み）
     key: str
 
@@ -35,7 +35,7 @@ class TownHit:
 
 
 @dataclass(frozen=True, slots=True)
-class CityHit:
+class CityMatch:
     lg_code: int
     key: str
 
@@ -44,20 +44,20 @@ class CityHit:
         return len(self.key)
 
 
-class TownIndex:
+class MachiazaIndex:
     """層1 の読み取り。プロセス間で安全に共有できる。"""
 
     def __init__(
         self,
         trie: ports.PrefixTrie,
-        store: ports.IndexReader,
+        reader: ports.IndexReader,
         *,
-        tries: ports.TrieFactory,
+        tries: ports.TrieBackend,
     ) -> None:
         self._trie = trie
-        self._store = store
-        self._prefs: list[PrefRecord] = store.prefs()
-        self._cities: list[CityRecord] = store.cities()
+        self._reader = reader
+        self._prefs: list[PrefRecord] = reader.prefs()
+        self._cities: list[CityRecord] = reader.cities()
         self._city_by_lg = {c.lg_code: c for c in self._cities}
         # 全国地方公共団体コードの上位 2 桁が都道府県コード。
         # 都道府県自身は 010006 のようにチェックディジットが付くので、上位で引く。
@@ -66,33 +66,36 @@ class TownIndex:
         self._pref_keys = _build_pref_keys(self._prefs)
 
     def close(self) -> None:
-        self._store.close()
+        self._reader.close()
 
     @property
-    def store(self) -> ports.IndexReader:
+    def reader(self) -> ports.IndexReader:
         """町字レコードと層2 の番号を引く先。"""
-        return self._store
+        return self._reader
 
     def city(self, lg_code: int) -> CityRecord | None:
         """全国地方公共団体コードから市区町村を引く。"""
         return self._city_by_lg.get(lg_code)
 
-    def pref_by_lg(self, lg_code: int) -> PrefRecord | None:
+    def pref(self, lg_code: int) -> PrefRecord | None:
         """任意の全国地方公共団体コードから都道府県を引く。"""
         return self._pref_by_code.get(lg_code // 10_000)
 
     # --------------------------------------------------------- 前方一致
 
-    def prefixes(self, text: str) -> list[TownHit]:
+    def prefixes(self, text: str) -> list[MachiazaMatch]:
         """``text`` の前方一致となる町字鍵をすべて返す。長い順。"""
-        hits = [TownHit(town_id=town_id, key=key) for key, town_id in self._trie.prefixes(text)]
+        hits = [
+            MachiazaMatch(row_id=row_id, key=key) for key, row_id in self._trie.prefixes_of(text)
+        ]
         hits.sort(key=lambda h: -h.matched_len)
         return hits
 
-    def city_prefixes(self, text: str) -> list[CityHit]:
+    def city_prefixes(self, text: str) -> list[CityMatch]:
         """``text`` の前方一致となる市区町村鍵を返す。長い順。"""
         hits = [
-            CityHit(lg_code=lg_code, key=key) for key, lg_code in self._city_trie.prefixes(text)
+            CityMatch(lg_code=lg_code, key=key)
+            for key, lg_code in self._city_trie.prefixes_of(text)
         ]
         hits.sort(key=lambda h: -h.matched_len)
         return hits
@@ -105,13 +108,13 @@ class TownIndex:
                 best = (pref, key)
         return best
 
-    def keys_under(self, prefix: str, limit: int) -> list[tuple[str, int]]:
+    def machiaza_extensions(self, prefix: str, limit: int) -> list[tuple[str, int]]:
         """``prefix`` で始まる索引鍵と、その町字。
 
         入力が索引鍵の先頭になっているケース（丁目や小字の省略）を拾うための
         完全一致の探索で、曖昧一致ではない。
         """
-        return self._trie.under(prefix, limit)
+        return self._trie.extensions_of(prefix, limit)
 
 
 def _city_alias_pairs(cities: Sequence[CityRecord]) -> list[tuple[str, int]]:

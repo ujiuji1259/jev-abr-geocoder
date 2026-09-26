@@ -27,7 +27,7 @@ import struct
 import zlib
 from collections.abc import Iterable, Sequence
 
-from ..models import NumberEntry, Point
+from ..address import Banchi, Point
 
 __all__ = ["CHUNK_SIZE", "FORMAT_VERSION", "encode", "decode", "sort_key"]
 
@@ -43,7 +43,7 @@ _HEADER = struct.Struct("<Bii")
 _NO_COORD = 0
 
 
-def sort_key(entry: NumberEntry) -> tuple[int, int, int]:
+def sort_key(entry: Banchi) -> tuple[int, int, int]:
     """エントリの整列順。目録の二分探索はこの順序を前提にする。"""
     return (entry.num1, entry.num2, entry.num3)
 
@@ -77,7 +77,7 @@ def _get_varint(data: bytes, pos: int) -> tuple[int, int]:
 # ----------------------------------------------------------------- encode
 
 
-def _encode_chunk(entries: Sequence[NumberEntry], base_lat: int, base_lon: int) -> bytes:
+def _encode_chunk(entries: Sequence[Banchi], base_lat: int, base_lon: int) -> bytes:
     buf = bytearray()
     prev_num1 = entries[0].num1
     for entry in entries:
@@ -96,7 +96,7 @@ def _encode_chunk(entries: Sequence[NumberEntry], base_lat: int, base_lon: int) 
     return zlib.compress(bytes(buf), 6)
 
 
-def encode(entries: Iterable[NumberEntry]) -> bytes:
+def encode(entries: Iterable[Banchi]) -> bytes:
     """町字 1 件分のエントリ列を BLOB にする。
 
     入力は :func:`sort_key` の順に並べ替えてから書く。
@@ -167,7 +167,7 @@ def _decode_chunk(
     base_lat: int,
     base_lon: int,
     want: int | None = None,
-) -> list[NumberEntry]:
+) -> list[Banchi]:
     """チャンクを展開する。
 
     ``want`` を与えると、``num1`` がそれに一致するものだけを組み立てる。
@@ -175,7 +175,7 @@ def _decode_chunk(
     絞る**のが効く。実測で 8,000 件の処理が 11.0 秒から 4.4 秒になった。
     """
     data = zlib.decompress(blob[offset : offset + length])
-    out: list[NumberEntry] = []
+    out: list[Banchi] = []
     pos = 0
     num1 = first_num1
     size = len(data)
@@ -190,7 +190,7 @@ def _decode_chunk(
         if lat_code != _NO_COORD:
             lon_code, pos = get(data, pos)
         if want is not None and num1 != want:
-            # 目当ての番号でなければ NumberEntry も Point も作らない。
+            # 目当ての番号でなければ Banchi も Point も作らない。
             continue
         point: Point | None = None
         if lat_code != _NO_COORD:
@@ -198,11 +198,11 @@ def _decode_chunk(
                 lat=(base_lat + lat_code - 1) / COORD_SCALE,
                 lon=(base_lon + lon_code) / COORD_SCALE,
             )
-        out.append(NumberEntry(num1=num1, num2=num2, num3=num3, point=point))
+        out.append(Banchi(num1=num1, num2=num2, num3=num3, point=point))
     return out
 
 
-def decode(blob: bytes, *, num1: int | None = None) -> list[NumberEntry]:
+def decode(blob: bytes, *, num1: int | None = None) -> list[Banchi]:
     """BLOB を展開する。
 
     ``num1`` を与えると、目録で二分探索してその番号を含みうるチャンクだけを
@@ -210,7 +210,7 @@ def decode(blob: bytes, *, num1: int | None = None) -> list[NumberEntry]:
     """
     directory = _Directory(blob)
     if num1 is None:
-        out: list[NumberEntry] = []
+        out: list[Banchi] = []
         for i, offset in enumerate(directory.offsets):
             out.extend(
                 _decode_chunk(
@@ -225,7 +225,7 @@ def decode(blob: bytes, *, num1: int | None = None) -> list[NumberEntry]:
         return out
 
     start, end = _chunk_range(directory.firsts, num1)
-    matched: list[NumberEntry] = []
+    matched: list[Banchi] = []
     for i in range(start, end + 1):
         matched.extend(
             _decode_chunk(

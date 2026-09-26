@@ -13,27 +13,27 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..models import NumberKind, Point, PrefRecord, TownName
+from ..address import BanchiKind, MachiazaName, Point, PrefRecord
 from . import csvsrc
 
 __all__ = [
     "CityRow",
-    "NumberRow",
-    "TownRow",
+    "BanchiRow",
+    "MachiazaRow",
     "read_cities",
-    "read_number_positions",
-    "read_numbers",
+    "read_banchi_positions",
+    "read_banchi",
     "read_prefs",
     "read_simple_positions",
     "read_town_positions",
-    "read_towns",
+    "read_machiaza",
 ]
 
 #: ABR の状態フラグ。3 は取り込まない。
 _EXCLUDED_STATUS = "3"
 
 #: 代表点の座標を (lg_code, machiaza_id, rsdt_addr_flg) で引ける形。
-TownPositions = Mapping[tuple[int, int, int], Point]
+MachiazaPositions = Mapping[tuple[int, int, int], Point]
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,28 +49,28 @@ class CityRow:
 
 
 @dataclass(frozen=True, slots=True)
-class TownRow:
+class MachiazaRow:
     """``mt_town`` の 1 行のうち、索引に要る分だけ。"""
 
     lg_code: int
     machiaza_id: int
     rsdt_addr_flg: int
-    name: TownName
+    name: MachiazaName
     point: Point | None
 
     @property
-    def slot(self) -> tuple[int, int]:
+    def machiaza_key(self) -> tuple[int, int]:
         """町字の同一性。ABR はこの組を ``rsdt_addr_flg`` 違いで 2 行持つことがある。"""
         return (self.lg_code, self.machiaza_id)
 
 
 @dataclass(frozen=True, slots=True)
-class NumberRow:
+class BanchiRow:
     """街区・住居番号・地番の 1 行。"""
 
     lg_code: int
     machiaza_id: int
-    #: 番号 3 つ組。意味は :class:`NumberKind` で変わる。
+    #: 番号 3 つ組。意味は :class:`BanchiKind` で変わる。
     nums: tuple[int, int, int]
     #: 位置参照拡張と突き合わせるための鍵。
     record_key: int
@@ -101,7 +101,7 @@ def read_town_positions(paths: Iterable[Path]) -> dict[tuple[int, int, int], Poi
     return out
 
 
-def read_number_positions(kind: NumberKind, path: Path | None) -> dict[int, dict[int, Point]]:
+def read_banchi_positions(kind: BanchiKind, path: Path | None) -> dict[int, dict[int, Point]]:
     """番号の位置参照拡張を lg_code -> 記録鍵 -> 座標 の形にする。"""
     out: dict[int, dict[int, Point]] = {}
     if path is None:
@@ -141,7 +141,7 @@ def read_cities(paths: Iterable[Path], positions: Mapping[int, Point]) -> Iterat
             )
 
 
-def read_towns(paths: Iterable[Path], positions: TownPositions) -> Iterator[TownRow]:
+def read_machiaza(paths: Iterable[Path], positions: MachiazaPositions) -> Iterator[MachiazaRow]:
     """``mt_town``。代表点も引き当てて返す。"""
     for path in paths:
         for row in csvsrc.read_rows(path):
@@ -150,11 +150,11 @@ def read_towns(paths: Iterable[Path], positions: TownPositions) -> Iterator[Town
             lg_code = int(row["lg_code"])
             machiaza_id = int(row["machiaza_id"])
             flg = _flg(row)
-            yield TownRow(
+            yield MachiazaRow(
                 lg_code=lg_code,
                 machiaza_id=machiaza_id,
                 rsdt_addr_flg=flg,
-                name=TownName(
+                name=MachiazaName(
                     pref=row.get("pref", ""),
                     county=row.get("county", ""),
                     city=row.get("city", ""),
@@ -174,12 +174,12 @@ def read_towns(paths: Iterable[Path], positions: TownPositions) -> Iterator[Town
             )
 
 
-def read_numbers(kind: NumberKind, path: Path) -> Iterator[NumberRow]:
+def read_banchi(kind: BanchiKind, path: Path) -> Iterator[BanchiRow]:
     """``mt_rsdtdsp_blk`` / ``mt_rsdtdsp_rsdt`` / ``mt_parcel``。"""
     for row in csvsrc.read_rows(path):
         if _excluded(row):
             continue
-        yield NumberRow(
+        yield BanchiRow(
             lg_code=int(row["lg_code"]),
             machiaza_id=int(row["machiaza_id"]),
             nums=_nums(kind, row),
@@ -205,10 +205,10 @@ def _point(row: Mapping[str, str]) -> Point | None:
     return Point(lat=float(lat), lon=float(lon))
 
 
-def _nums(kind: NumberKind, row: Mapping[str, str]) -> tuple[int, int, int]:
-    if kind is NumberKind.BLOCK:
+def _nums(kind: BanchiKind, row: Mapping[str, str]) -> tuple[int, int, int]:
+    if kind is BanchiKind.BLOCK:
         return int(row.get("blk_num") or 0), 0, 0
-    if kind is NumberKind.RSDT:
+    if kind is BanchiKind.RSDT:
         return (
             int(row.get("blk_num") or 0),
             int(row.get("rsdt_num") or 0),
@@ -222,12 +222,12 @@ def _nums(kind: NumberKind, row: Mapping[str, str]) -> tuple[int, int, int]:
     return int(prc_id[0:5]), int(prc_id[5:10]), int(prc_id[10:15])
 
 
-def _record_key(kind: NumberKind, row: Mapping[str, str]) -> int:
+def _record_key(kind: BanchiKind, row: Mapping[str, str]) -> int:
     """本体と位置参照を突き合わせる鍵。ID 列はゼロ詰めなので整数化して使う。"""
     machiaza = int(row["machiaza_id"])
-    if kind is NumberKind.BLOCK:
+    if kind is BanchiKind.BLOCK:
         return _pack(machiaza, int(row["blk_id"]))
-    if kind is NumberKind.RSDT:
+    if kind is BanchiKind.RSDT:
         return _pack(
             machiaza,
             int(row["blk_id"]),

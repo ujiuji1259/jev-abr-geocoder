@@ -79,7 +79,7 @@ async def test_choice_never_exceeds_the_api_limit() -> None:
 async def test_same_subject_is_stated_once() -> None:
     """同じ材料を問ごとに複製しない。
 
-    分割絞り込み (beam) は 1 つの入力について何十問も並べるので、材料を
+    分割絞り込み は 1 つの入力について何十問も並べるので、材料を
     複製するとトークンがそのぶん嵩む。
     """
     subject = {"入力": "福井市中央1-1"}
@@ -101,7 +101,7 @@ async def test_cited_labels_are_referenced_by_name() -> None:
     client = _FakeClient()
     model = JevModel(client, "jev-latest", 30.0)
     await model.choose(
-        [_question(["1-2"], subject={"入力": "x", "町字": "面影一丁目"}, cite=("町字",))]
+        [_question(["1-2"], subject={"入力": "x", "町字": "面影一丁目"}, refers_to=("町字",))]
     )
 
     state, questions = client.calls[0]

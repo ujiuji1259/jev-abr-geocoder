@@ -4,51 +4,51 @@
 ない。順位付けは Jev の仕事なので、ここで 1 位を固定するテストは書かない。
 """
 
+from jev_abr_geocoder.address import Granularity
 from jev_abr_geocoder.config import GeocoderConfig
-from jev_abr_geocoder.index.townindex import TownIndex
+from jev_abr_geocoder.index.machiaza_index import MachiazaIndex
 from jev_abr_geocoder.match.candidates import CandidateFinder
-from jev_abr_geocoder.models import Level
 from jev_abr_geocoder.textnorm import normalize
 
 
-def _finder(index: TownIndex) -> CandidateFinder:
+def _finder(index: MachiazaIndex) -> CandidateFinder:
     return CandidateFinder(index, GeocoderConfig())
 
 
-def _displays(index: TownIndex, normalized: str) -> list[str]:
+def _displays(index: MachiazaIndex, normalized: str) -> list[str]:
     found = _finder(index).find(normalized)
-    records = index.store.towns([c.town_id for c in found.candidates])
-    return [records[c.town_id].display for c in found.candidates]
+    records = index.reader.machiaza([c.row_id for c in found.candidates])
+    return [records[c.row_id].name.display for c in found.candidates]
 
 
-def test_exact_prefix_match(index: TownIndex) -> None:
+def test_exact_prefix_match(index: MachiazaIndex) -> None:
     found = _finder(index).find(normalize("鳥取県鳥取市面影一丁目1番2号"))
-    assert found.exact
-    records = index.store.towns([c.town_id for c in found.candidates])
-    assert records[found.candidates[0].town_id].town == "面影一丁目"
+    assert found.prefix_matched
+    records = index.reader.machiaza([c.row_id for c in found.candidates])
+    assert records[found.candidates[0].row_id].name.machiaza == "面影一丁目"
     assert found.candidates[0].remainder == "1番2号"
 
 
-def test_alias_lets_arabic_chome_match(index: TownIndex) -> None:
+def test_alias_lets_arabic_chome_match(index: MachiazaIndex) -> None:
     assert "鳥取県鳥取市面影一丁目" in _displays(index, normalize("鳥取市面影1丁目1-2"))
 
 
-def test_alias_lets_oaza_be_omitted(index: TownIndex) -> None:
+def test_alias_lets_oaza_be_omitted(index: MachiazaIndex) -> None:
     assert "鳥取県鳥取市大字福井" in _displays(index, normalize("鳥取市福井"))
 
 
-def test_alias_lets_county_be_omitted(index: TownIndex) -> None:
+def test_alias_lets_county_be_omitted(index: MachiazaIndex) -> None:
     assert "長崎県北松浦郡佐々町石木場免" in _displays(index, normalize("佐々町石木場免1-1"))
 
 
-def test_typo_hands_the_whole_city_to_jev(index: TownIndex) -> None:
+def test_typo_hands_the_whole_city_to_jev(index: MachiazaIndex) -> None:
     """誤字・異体字は、その市区町村の町字を全部 Jev に渡す。
 
     編集距離で順位づけするのではなく、絞り込みを諦めて判断を委ねる。
     異体字の同定は Jev の得意分野で、こちらが距離で順位をつける筋合いがない。
     """
     found = _finder(index).find(normalize("鳥取県鳥取市面かげ1丁目1-2"))
-    assert not found.exact
+    assert not found.prefix_matched
     assert found.city_lg_code is not None
     displays = _displays(index, normalize("鳥取県鳥取市面かげ1丁目1-2"))
     assert "鳥取県鳥取市面影一丁目" in displays  # 正解が候補に入っている
@@ -57,54 +57,54 @@ def test_typo_hands_the_whole_city_to_jev(index: TownIndex) -> None:
     assert all(c.remainder == "1丁目1-2" for c in found.candidates)
 
 
-def test_city_wide_marks_overflow_for_beam(index: TownIndex) -> None:
+def test_city_wide_marks_overflow_for_beam(index: MachiazaIndex) -> None:
     """255 件に収まらないときは全件を持ち帰り、分割絞り込みに回す。"""
     from jev_abr_geocoder.config import GeocoderConfig
 
-    cfg = GeocoderConfig(max_options=3, beam=True)  # 候補は 2 件まで
+    cfg = GeocoderConfig(max_options=3, narrow_by_oaza=True)  # 候補は 2 件まで
     found = CandidateFinder(index, cfg).find(normalize("鳥取県鳥取市面かげ1丁目1-2"))
-    assert found.needs_beam
+    assert found.needs_narrowing
     assert len(found.candidates) > cfg.max_candidates
 
 
-def test_city_wide_gives_up_when_beam_is_disabled(index: TownIndex) -> None:
-    """beam を切れば、従来どおり粒度を落とす。"""
+def test_city_wide_gives_up_when_beam_is_disabled(index: MachiazaIndex) -> None:
+    """分割絞り込みを切れば、従来どおり粒度を落とす。"""
     from jev_abr_geocoder.config import GeocoderConfig
 
-    cfg = GeocoderConfig(max_options=3, beam=False)
+    cfg = GeocoderConfig(max_options=3, narrow_by_oaza=False)
     found = CandidateFinder(index, cfg).find(normalize("鳥取県鳥取市面かげ1丁目1-2"))
     assert found.candidates == []
     assert found.city_lg_code is not None
 
 
-def test_input_ending_at_city_yields_no_town_candidates(index: TownIndex) -> None:
+def test_input_ending_at_city_yields_no_town_candidates(index: MachiazaIndex) -> None:
     found = _finder(index).find(normalize("鳥取県鳥取市"))
     assert found.candidates == []
-    assert found.exhausted is Level.CITY
+    assert found.ends_at is Granularity.CITY
     assert found.city_lg_code is not None
 
 
-def test_input_ending_at_pref_yields_pref_level(index: TownIndex) -> None:
+def test_input_ending_at_pref_yields_pref_level(index: MachiazaIndex) -> None:
     found = _finder(index).find(normalize("鳥取県"))
     assert found.candidates == []
-    assert found.exhausted is Level.PREF
+    assert found.ends_at is Granularity.PREF
     assert found.pref_lg_code is not None
 
 
-def test_non_address_yields_nothing(index: TownIndex) -> None:
+def test_non_address_yields_nothing(index: MachiazaIndex) -> None:
     found = _finder(index).find(normalize("ここは住所ではありません"))
     assert found.candidates == []
-    assert found.exhausted is None
+    assert found.ends_at is None
     assert found.city_lg_code is None
 
 
-def test_candidates_never_exceed_the_choice_limit(index: TownIndex) -> None:
+def test_candidates_never_exceed_the_choice_limit(index: MachiazaIndex) -> None:
     cfg = GeocoderConfig(max_options=2)
     found = CandidateFinder(index, cfg).find(normalize("鳥取市面影"))
     assert len(found.candidates) <= 2
 
 
-def test_unambiguous_picks_the_strictly_longest_match(index: TownIndex) -> None:
+def test_unambiguous_picks_the_strictly_longest_match(index: MachiazaIndex) -> None:
     """「面影一丁目」と「面影」が両方当たっても、長いほうで確定できること。
 
     これは類似度の判断ではなく前方一致の定義なので、トライが決めてよい。
@@ -113,37 +113,37 @@ def test_unambiguous_picks_the_strictly_longest_match(index: TownIndex) -> None:
     assert len(found.candidates) > 1  # 短い一致も候補には入っている
     chosen = found.unambiguous()
     assert chosen is not None
-    records = index.store.towns([chosen.town_id])
-    assert records[chosen.town_id].town == "面影一丁目"
+    records = index.reader.machiaza([chosen.row_id])
+    assert records[chosen.row_id].name.machiaza == "面影一丁目"
 
 
-def test_unambiguous_gives_up_when_same_length_matches_collide(index: TownIndex) -> None:
+def test_unambiguous_gives_up_when_same_length_matches_collide(index: MachiazaIndex) -> None:
     """同一市区町村に同名の町字が複数あるときは Jev に委ねる。"""
     found = _finder(index).find(normalize("京都府京都市中京区大文字町45"))
     assert len(found.candidates) == 2
     assert found.unambiguous() is None
 
 
-def test_unambiguous_gives_up_when_input_is_a_key_prefix(index: TownIndex) -> None:
+def test_unambiguous_gives_up_when_input_is_a_key_prefix(index: MachiazaIndex) -> None:
     """入力が言いかけのときは、どの町字かを決められないので Jev に委ねる。
 
     自由が丘は ABR に丁目なしの行が無いので、「自由が丘」だけでは
     索引鍵の先頭一致にしかならない。
     """
     found = _finder(index).find(normalize("東京都目黒区自由が丘"))
-    assert not found.exact
+    assert not found.prefix_matched
     assert found.candidates
     assert found.unambiguous() is None
 
 
-def test_kanji_chome_matches_arabic_source(index: TownIndex) -> None:
+def test_kanji_chome_matches_arabic_source(index: MachiazaIndex) -> None:
     """ABR が「２丁目」で持っていても、入力の「二丁目」で引けること。"""
     assert "東京都目黒区自由が丘２丁目" in _displays(
         index, normalize("東京都目黒区自由が丘二丁目17-6")
     )
 
 
-def test_input_that_is_a_prefix_of_index_keys(index: TownIndex) -> None:
+def test_input_that_is_a_prefix_of_index_keys(index: MachiazaIndex) -> None:
     """「面影」だけでは ABR に行が無いが、索引鍵の側がこの入力で始まっている。
 
     丁目を持つ大字のうち、丁目なしの親エントリも在るのは全国で 19% だけ。
@@ -154,21 +154,21 @@ def test_input_that_is_a_prefix_of_index_keys(index: TownIndex) -> None:
     assert all(c.remainder == "" for c in found.candidates)
 
 
-def test_trailing_number_is_stripped_before_the_prefix_lookup(index: TownIndex) -> None:
+def test_trailing_number_is_stripped_before_the_prefix_lookup(index: MachiazaIndex) -> None:
     """番地が付いていても、削ってから索引鍵の先頭一致を試す。"""
     found = _finder(index).find(normalize("鳥取県鳥取市大字福井字上町"))
     # 大字福井 に小字は無いので、福井そのものが前方一致する
-    assert found.exact or found.candidates
+    assert found.prefix_matched or found.candidates
 
 
-def test_unknown_city_yields_pref_only(index: TownIndex) -> None:
+def test_unknown_city_yields_pref_only(index: MachiazaIndex) -> None:
     found = _finder(index).find(normalize("鳥取県そんな市は無い町1-2"))
     assert found.candidates == []
     assert found.pref_lg_code is not None
     assert found.city_lg_code is None
 
 
-def test_prefix_match_never_splits_a_number(index: TownIndex) -> None:
+def test_prefix_match_never_splits_a_number(index: MachiazaIndex) -> None:
     """丁目省略のエイリアスが地番の先頭を食わないこと。
 
     「面影1」という鍵は「面影1189-4」の先頭 1 文字にも当たるが、
@@ -180,7 +180,7 @@ def test_prefix_match_never_splits_a_number(index: TownIndex) -> None:
     assert "鳥取県鳥取市面影一丁目" not in displays
 
 
-def test_chome_omission_still_matches_at_a_separator(index: TownIndex) -> None:
+def test_chome_omission_still_matches_at_a_separator(index: MachiazaIndex) -> None:
     """区切りで終わっていれば丁目省略の一致は有効。"""
     displays = _displays(index, normalize("鳥取県鳥取市面影1-1-2"))
     assert "鳥取県鳥取市面影一丁目" in displays

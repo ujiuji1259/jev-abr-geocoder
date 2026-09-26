@@ -68,7 +68,7 @@ geocoder = Geocoder(adapters.open_index(Path("data")), MyModel(), GeocoderConfig
 | Jev 往復 | 25 回（7,191 件全体で） |
 | コスト | **$0.0081**（$0.0011 / 1,000 件） |
 | 全体の処理時間 | 6.5 秒（0.90 ms/件） |
-| 索引 | `town.marisa` 25MB + `abr.db` 67MB（町字まで） |
+| 索引 | `machiaza.marisa` 25MB + `abr.db` 67MB（町字まで） |
 
 一致率は「geolonia との合意率」であって正解率ではない（[docs/eval.md](docs/eval.md) §4）。
 

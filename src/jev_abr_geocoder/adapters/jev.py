@@ -17,7 +17,7 @@ from typing import Any
 
 from .. import ports
 from ..config import NONE_OPTION, NONE_OPTION_DESCRIPTION, GeocoderConfig
-from ..models import Decision, Usage
+from ..decision import Decision, Usage
 
 __all__ = ["JevModel", "MAX_CHOICE_OPTIONS"]
 
@@ -42,9 +42,9 @@ class JevModel:
 
         return cls(AsyncTypeSafeClient(), cfg.model, cfg.timeout)
 
-    async def choose(self, questions: Sequence[ports.Question]) -> ports.ChoiceSet:
+    async def choose(self, questions: Sequence[ports.Question]) -> ports.Answers:
         if not questions:
-            return ports.ChoiceSet(decisions=[], usage=Usage())
+            return ports.Answers(decisions=[], usage=Usage())
 
         state, payload = _build(questions)
         try:
@@ -57,7 +57,7 @@ class JevModel:
 
         usage = Usage()
         usage.add(*_tokens(response))
-        return ports.ChoiceSet(
+        return ports.Answers(
             decisions=[_decision(answers.get(_question_id(i))) for i in range(len(questions))],
             usage=usage,
         )
@@ -66,7 +66,7 @@ class JevModel:
 def _build(questions: Sequence[ports.Question]) -> tuple[dict[str, Any], dict[str, Any]]:
     """``(state, questions)`` を組む。
 
-    **同じ材料は ``state`` に 1 つしか置かない。** 分割絞り込み (beam) は同じ
+    **同じ材料は ``state`` に 1 つしか置かない。** 分割絞り込み は同じ
     入力について何十問も並べるので、材料を問ごとに複製するとトークンが嵩む。
     """
     from typesafe_sdk import Choice
@@ -84,7 +84,7 @@ def _build(questions: Sequence[ports.Question]) -> tuple[dict[str, Any], dict[st
             subject_keys[fingerprint] = key
 
         instructions: dict[str, Any] = {"対象": f"`{key}`"}
-        for label in question.cite:
+        for label in question.refers_to:
             instructions[label] = f"`{key}.{label}`"
         instructions["質問"] = question.question
 

@@ -38,7 +38,7 @@
   │
   ├─ ① 正規化          NFKC + 空白除去のみ
   │
-  ├─ ② 住所トライ      完全一致 2 方向で町字候補を取得    層1 (town.marisa 24MB, mmap)
+  ├─ ② 住所トライ      完全一致 2 方向で町字候補を取得    層1 (machiaza.marisa 24MB, mmap)
   │      索引鍵が入力の先頭 / 入力が索引鍵の先頭
   │
   ├─ ③ Jev Choice      町字を確定 (候補 ≤ 255)           確信度つき
@@ -70,7 +70,7 @@
 
 座標はすべて `EPSG:6668` (JGD2011) の代表点。地番の座標も取り込む。
 
-### 3.1 層1: 住所トライ `town.marisa`
+### 3.1 層1: 住所トライ `machiaza.marisa`
 
 対象は `mt_pref` / `mt_city` / `mt_town`。実装は [marisa-trie](https://github.com/pytries/marisa-trie)（LOUDS 簡潔トライ）の `RecordTrie`。
 
@@ -85,7 +85,7 @@
 marisa-trie を採る。**全国の都道府県 → 市区町村 → 町字が 1 つのファイルに収まり、mmap ロードが 0.2 ms、常駐 RSS が 1 MB**。
 
 > 実装後の実測: エイリアス規則を確定させた結果、鍵は 4,817,051 本、
-> ``town.marisa`` は **24.3 MB**、構築は全国で 76 秒（ダウンロード済みから）。
+> ``machiaza.marisa`` は **24.3 MB**、構築は全国で 76 秒（ダウンロード済みから）。
 > 上表は規則確定前の 2,268,688 鍵での測定値。
 
 API サーバではこれが決定的に効く。mmap されたファイルは**ページキャッシュ経由で全ワーカーが同一の物理メモリを共有する**ため、ワーカーを何本立てても層1のコストは 13 MB のまま変わらない。起動が 0.2 ms なのでスケールアウトとローリング再起動も軽い。
@@ -104,7 +104,7 @@ API サーバではこれが決定的に効く。mmap されたファイルは**
 
 軸にすると「大字は原文どおり書くが字は省く」という混ぜた形まで張ることになるが、そんな書き方は実在しない。大字・字の両方に接頭辞がある町字は全国 57,033 件（7.7%）あり、そこが 4 通りに膨らんでいた。
 
-| | 索引鍵 | `town.marisa` |
+| | 索引鍵 | `machiaza.marisa` |
 |---|---:|---:|
 | 接頭辞を軸にする | 5,228,310 | 26.3 MB |
 | **付け方 2 通りで張る** | **4,817,051** (−7.9%) | **24.6 MB** |
@@ -123,7 +123,7 @@ API サーバではこれが決定的に効く。mmap されたファイルは**
 
 多値になるのは「入力の表記だけでは町字が決まらない」ときだけであるべきで、**データの持ち方の違いで多値になってはいけない**。同じ場所が 2 つの選択肢として Jev に出ると答えようがなく、確信度が割れて粒度が落ちる。
 
-| | 町字 | 索引鍵 | 重複鍵 | `town.marisa` |
+| | 町字 | 索引鍵 | 重複鍵 | `machiaza.marisa` |
 |---|---:|---:|---:|---:|
 | 素朴に取り込む | 788,323 | 5,154,108 | 288,252 (5.59%) | 28.5 MB |
 | Geolonia を畳む | 737,881 | 4,817,051 | 36,256 (0.75%) | 24.6 MB |
@@ -148,7 +148,7 @@ mz=0414000 oaza_cho='計根別北'   efct_date=1947-04-17 status_flg=1 src_code=
 - 栗原市の 3 組すべてで両側に地番があり、**空間的に隣接**して番号帯だけが割れている。`築館字青野` の実体（42-1〜101）は `築館青野`（1〜11）のすぐ隣
 - `rsdt_addr_flg` / `src_code` / `machiaza_type` の**どれもペアを説明しない**（6 割は両側同じ値）
 
-したがって 1 行にまとめる。ただし**地番が両方の `machiaza_id` に割れている**（栗原市築館新田は字あり側 324 筆、字なし側に別の 10 筆）ので、まとめた側の `machiaza_id` を `town.alt_machiaza` に残し、**層2 は全部引く**（`Geocoder._fetch_numbers`）。単なる重複削除ではなくデータ欠損の修正でもある。
+したがって 1 行にまとめる。ただし**地番が両方の `machiaza_id` に割れている**（栗原市築館新田は字あり側 324 筆、字なし側に別の 10 筆）ので、まとめた側の `machiaza_id` を `MachiazaRecord.alt_machiaza` に残し、**層2 は全部引く**（`match/banchi.py`）。単なる重複削除ではなくデータ欠損の修正でもある。
 
 効果（鳥取県 20,235 件、法人番号）:
 
@@ -300,7 +300,7 @@ instructions: "入力が指している住所はどれか"
 
 最長一致のファストパスを入れる前は 12.2% が Jev 送りだった。**14 分の 1 に落ちている。** 残った 62 件は同名町・「箪笥町/簞笥町」・「緑が浜/緑ヶ浜」など、実際に判断が要るものばかり。
 
-`--always-rerank` で無効化して、Jev 経路の精度を評価できるようにする。
+`--always-ask` で無効化して、Jev 経路の精度を評価できるようにする。
 
 ### 5.4 confidence の使い方
 
@@ -363,4 +363,4 @@ build --level parcel --pref 31  # 都道府県を絞る
 
 - [ABR データセット](https://dataset.address-br.digital.go.jp/) / [利用規約](https://www.digital.go.jp/policies/base_registry_address_tos)
 - [digital-go-jp/abr-geocoder](https://github.com/digital-go-jp/abr-geocoder) — デジタル庁公式実装 (Go)
-- [TypeSafe Jev ドキュメント](https://docs.typesafe.ai/) / [API リファレンス](https://docs.typesafe.ai/api) / [再ランククックブック](https://docs.typesafe.ai/cookbooks/rerank_typesafe)
+- [TypeSafe Jev ドキュメント](https://docs.typesafe.ai/) / [API リファレンス](https://docs.typesafe.ai/api) / [候補選択クックブック](https://docs.typesafe.ai/cookbooks/rerank_typesafe)

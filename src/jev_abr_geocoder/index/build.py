@@ -6,7 +6,7 @@ ABR の CSV から ``town.marisa`` と ``abr.db`` を作る。地番まで取る
 だけを処理する。これがそのまま差分更新になる。
 
 ここにあるのは段取りだけ。CSV の列の読み方は :mod:`abr.rows`、町字の畳み込みは
-:mod:`index.towntable` にある。
+:mod:`index.machiaza_table` にある。
 
 ピークメモリは層2 の最大ファイル（大阪府の住居番号、約 220 万行）で 350 MB 程度。
 
@@ -26,18 +26,18 @@ from .._version import __version__
 from ..abr import geolonia, rows
 from ..abr.catalog import BuildLevel, FileRef, Scope, fetch_feed, kinds_for_level, select
 from ..abr.fetch import Downloaded, Downloader
-from ..models import CityRecord, NumberEntry, NumberKind
-from .towntable import TownStats, TownTable
+from ..address import Banchi, BanchiKind, CityRecord
+from .machiaza_table import MachiazaStats, MachiazaTable
 
 __all__ = ["BuildReport", "build", "BuildProgress"]
 
 #: (フェーズ名, 完了, 総数, 補足) を受け取る進捗通知。
 BuildProgress = Callable[[str, int, int, str], None]
 
-_KIND_TO_NUMBER: dict[str, NumberKind] = {
-    "mt_rsdtdsp_blk": NumberKind.BLOCK,
-    "mt_rsdtdsp_rsdt": NumberKind.RSDT,
-    "mt_parcel": NumberKind.PARCEL,
+_KIND_TO_BANCHI: dict[str, BanchiKind] = {
+    "mt_rsdtdsp_blk": BanchiKind.BLOCK,
+    "mt_rsdtdsp_rsdt": BanchiKind.RSDT,
+    "mt_parcel": BanchiKind.PARCEL,
 }
 
 
@@ -50,21 +50,21 @@ class BuildReport:
     prefs: int = 0
     cities: int = 0
     towns: int = 0
-    geolonia_towns: int = 0
+    geolonia_added: int = 0
     #: ABR に既にあったので行を足さず別名だけ足した Geolonia の町字。
     geolonia_merged: int = 0
     #: 大字・字の違いだけの別レコードとしてまとめた ABR の町字。
-    towns_folded: int = 0
+    machiaza_folded: int = 0
     trie_keys: int = 0
-    numbers: int = 0
+    banchi: int = 0
     elapsed: float = 0.0
     notes: list[str] = field(default_factory=list)
 
-    def apply(self, stats: TownStats) -> None:
+    def apply(self, stats: MachiazaStats) -> None:
         self.towns = stats.towns
-        self.trie_keys = stats.keys
-        self.towns_folded = stats.folded
-        self.geolonia_towns = stats.geolonia_added
+        self.trie_keys = stats.trie_keys
+        self.machiaza_folded = stats.folded
+        self.geolonia_added = stats.geolonia_added
         self.geolonia_merged = stats.geolonia_merged
 
 
@@ -120,50 +120,50 @@ def _build_cities(writer: ports.IndexWriter, text: Sequence[Path], pos: Sequence
     return len(records)
 
 
-def _build_towns(
+def _build_machiaza(
     writer: ports.IndexWriter,
-    tries: ports.TrieFactory,
+    backend: ports.TrieBackend,
     trie_path: Path,
     text: Sequence[Path],
     pos: Sequence[Path],
     geolonia_csv: Path | None = None,
-) -> TownStats:
+) -> MachiazaStats:
     """``town`` テーブルと前方一致トライを作る。どちらも毎回作り直す。"""
-    table = TownTable()
-    table.add_abr(rows.read_towns(text, rows.read_town_positions(pos)))
+    table = MachiazaTable()
+    table.add_abr(rows.read_machiaza(text, rows.read_town_positions(pos)))
     if geolonia_csv is not None:
         table.add_geolonia(geolonia.read_rows(geolonia_csv))
-    writer.replace_towns(table.records)
-    tries.save(table.pairs, trie_path)
+    writer.replace_machiaza(table.records)
+    backend.save(table.pairs, trie_path)
     return table.stats
 
 
 # ------------------------------------------------------------------ 層2
 
 
-def _ingest_numbers(
-    writer: ports.IndexWriter, kind: NumberKind, text_path: Path, pos_path: Path | None
+def _ingest_banchi(
+    writer: ports.IndexWriter, kind: BanchiKind, text_path: Path, pos_path: Path | None
 ) -> int:
     """1 ファイル分の番号を町字単位の BLOB にして書き込む。"""
-    positions = rows.read_number_positions(kind, pos_path)
+    positions = rows.read_banchi_positions(kind, pos_path)
 
-    groups: dict[tuple[int, int], list[NumberEntry]] = {}
-    for row in rows.read_numbers(kind, text_path):
+    groups: dict[tuple[int, int], list[Banchi]] = {}
+    for row in rows.read_banchi(kind, text_path):
         groups.setdefault((row.lg_code, row.machiaza_id), []).append(
-            NumberEntry(*row.nums, point=positions.get(row.lg_code, {}).get(row.record_key))
+            Banchi(*row.nums, point=positions.get(row.lg_code, {}).get(row.record_key))
         )
     del positions
 
     written = 0
-    batch: list[tuple[int, int, NumberKind, Sequence[NumberEntry]]] = []
+    batch: list[tuple[int, int, BanchiKind, Sequence[Banchi]]] = []
     for (lg_code, machiaza_id), entries in groups.items():
         batch.append((lg_code, machiaza_id, kind, entries))
         written += len(entries)
         if len(batch) >= 512:
-            writer.put_numbers_many(batch)
+            writer.put_banchi(batch)
             batch.clear()
     if batch:
-        writer.put_numbers_many(batch)
+        writer.put_banchi(batch)
     return written
 
 
@@ -182,7 +182,7 @@ async def build(
     progress: BuildProgress | None = None,
     refs: Sequence[FileRef] | None = None,
     http: ports.HttpClient | None = None,
-    tries: ports.TrieFactory | None = None,
+    trie_backend: ports.TrieBackend | None = None,
     writer: ports.IndexWriter | None = None,
     trie_path: Path | None = None,
 ) -> BuildReport:
@@ -194,7 +194,7 @@ async def build(
     ``with_geolonia`` が True なら、ABR に無い町字を Geolonia 住所データ
     (CC BY 4.0) で補う。帰属表示が要るので ``meta`` に記録する。
 
-    ``http`` / ``tries`` / ``writer`` / ``trie_path`` を省略すると既定の
+    ``http`` / ``trie_backend`` / ``writer`` / ``trie_path`` を省略すると既定の
     アダプタを使う。**ここが構築側の合成の根**で、差し替えたい呼び出し側
     （テストや別バックエンド）は同じポートを満たすものを渡せばよい。
     """
@@ -208,7 +208,7 @@ async def build(
         if progress is not None:
             progress(phase, done, total, detail)
 
-    factory = tries or adapters.tries()
+    backend = trie_backend or adapters.trie_backend()
     target = trie_path or adapters.trie_path(data_dir)
     client = http or adapters.http_client()
     try:
@@ -271,27 +271,27 @@ async def build(
         if "mt_town" in by_kind:
             notify("layer1", 2, 3, "町字とトライ")
             report.apply(
-                _build_towns(
+                _build_machiaza(
                     store,
-                    factory,
+                    backend,
                     target,
                     [d.path for d in by_kind["mt_town"]],
                     [d.path for d in by_kind.get("mt_town_pos", [])],
                     geolonia_csv,
                 )
             )
-            if report.geolonia_towns or report.geolonia_merged:
+            if report.geolonia_added or report.geolonia_merged:
                 store.set_meta("geolonia_attribution", geolonia.ATTRIBUTION)
-                store.set_meta("geolonia_towns", str(report.geolonia_towns))
+                store.set_meta("geolonia_added", str(report.geolonia_added))
                 store.set_meta("geolonia_merged", str(report.geolonia_merged))
         notify("layer1", 3, 3, "完了")
         store.commit()
 
         number_pairs = [
-            (text, pos) for text, pos in _pair_files(downloads) if text.ref.kind in _KIND_TO_NUMBER
+            (text, pos) for text, pos in _pair_files(downloads) if text.ref.kind in _KIND_TO_BANCHI
         ]
         for index, (text, pos) in enumerate(number_pairs):
-            kind = _KIND_TO_NUMBER[text.ref.kind]
+            kind = _KIND_TO_BANCHI[text.ref.kind]
             known = store.source_last_modified(text.ref.url)
             unchanged = (
                 not force
@@ -303,8 +303,8 @@ async def build(
                 notify("layer2", index + 1, len(number_pairs), f"{text.ref.filename} (変更なし)")
                 continue
             notify("layer2", index + 1, len(number_pairs), text.ref.filename)
-            written = _ingest_numbers(store, kind, text.path, pos.path if pos else None)
-            report.numbers += written
+            written = _ingest_banchi(store, kind, text.path, pos.path if pos else None)
+            report.banchi += written
             store.mark_source(text.ref.url, text.ref.kind, text.last_modified, written)
             store.commit()
 

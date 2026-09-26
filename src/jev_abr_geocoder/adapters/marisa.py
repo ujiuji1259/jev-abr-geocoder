@@ -23,11 +23,11 @@ import marisa_trie
 
 from .. import ports
 
-__all__ = ["MarisaTrie", "MarisaTries", "TRIE_FILENAME", "PAYLOAD_FORMAT"]
+__all__ = ["MarisaTrie", "MarisaBackend", "TRIE_FILENAME", "PAYLOAD_FORMAT"]
 
-TRIE_FILENAME = "town.marisa"
+TRIE_FILENAME = "machiaza.marisa"
 
-#: ペイロードは町字レコードへのインデックス (town_id) だけ。
+#: ペイロードは町字レコードへのインデックス (row_id) だけ。
 #: 鍵は 4.9M 本あるが町字は 727k 件なので、レコードを埋め込むと 6.8 倍冗長になる。
 #: また鍵は NFKC 後のエイリアスであり、出力すべき ABR 正規表記とは別物。
 PAYLOAD_FORMAT = "<I"
@@ -39,14 +39,15 @@ class MarisaTrie:
     def __init__(self, trie: Any) -> None:
         self._trie = trie
 
-    def prefixes(self, text: str) -> list[tuple[str, int]]:
+    def prefixes_of(self, text: str) -> list[tuple[str, int]]:
         out: list[tuple[str, int]] = []
+        # marisa 側の prefixes() は「鍵が text の接頭辞になっているもの」。
         for key in self._trie.prefixes(text):
             for payload in self._trie[key]:
                 out.append((key, int(payload[0])))
         return out
 
-    def under(self, prefix: str, limit: int) -> list[tuple[str, int]]:
+    def extensions_of(self, prefix: str, limit: int) -> list[tuple[str, int]]:
         out: list[tuple[str, int]] = []
         for key, payload in self._trie.items(prefix):
             out.append((key, int(payload[0])))
@@ -55,8 +56,8 @@ class MarisaTrie:
         return out
 
 
-class MarisaTries:
-    """:class:`ports.TrieFactory` の marisa 実装。"""
+class MarisaBackend:
+    """:class:`ports.TrieBackend` の marisa 実装。"""
 
     def load(self, path: Path) -> ports.PrefixTrie:
         trie = marisa_trie.RecordTrie(PAYLOAD_FORMAT)

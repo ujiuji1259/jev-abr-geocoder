@@ -14,23 +14,22 @@ from pathlib import Path
 import pytest
 
 from jev_abr_geocoder import adapters, ports
-from jev_abr_geocoder.index.keys import town_aliases
-from jev_abr_geocoder.index.townindex import TownIndex
-from jev_abr_geocoder.models import (
+from jev_abr_geocoder.address import (
+    Banchi,
+    BanchiKind,
     CityRecord,
-    Decision,
-    NumberEntry,
-    NumberKind,
+    MachiazaName,
+    MachiazaRecord,
     Point,
     PrefRecord,
-    TownName,
-    TownRecord,
-    Usage,
 )
+from jev_abr_geocoder.decision import Decision, Usage
+from jev_abr_geocoder.index.keys import machiaza_aliases
+from jev_abr_geocoder.index.machiaza_index import MachiazaIndex
 
 
 @dataclass(frozen=True)
-class _Town:
+class _Machiaza:
     lg_code: int
     machiaza_id: int
     pref: str
@@ -57,18 +56,20 @@ class _Town:
 #: - 自由が丘２丁目    … ABR 側が全角算用数字で収録している丁目
 #: - 北松浦郡佐々町    … 郡の省略と地番
 #: - 大文字町 x 2     … 同名の町字が同一市区町村に複数ある（Jev 送りになる）
-_TOWNS = [
-    _Town(
+_MACHIAZA = [
+    _Machiaza(
         312011, 55001, "鳥取県", "", "鳥取市", "", "面影", "一丁目", "1", "", 1, 35.4797, 134.2458
     ),
-    _Town(
+    _Machiaza(
         312011, 55002, "鳥取県", "", "鳥取市", "", "面影", "二丁目", "2", "", 1, 35.4801, 134.2470
     ),
-    _Town(312011, 55000, "鳥取県", "", "鳥取市", "", "面影", "", "", "", 0, 35.4799, 134.2464),
-    _Town(312011, 12000, "鳥取県", "", "鳥取市", "", "叶", "", "", "", 0, 35.5100, 134.2200),
-    _Town(312011, 13000, "鳥取県", "", "鳥取市", "", "大字福井", "", "", "", 0, 35.5200, 134.2300),
+    _Machiaza(312011, 55000, "鳥取県", "", "鳥取市", "", "面影", "", "", "", 0, 35.4799, 134.2464),
+    _Machiaza(312011, 12000, "鳥取県", "", "鳥取市", "", "叶", "", "", "", 0, 35.5100, 134.2200),
+    _Machiaza(
+        312011, 13000, "鳥取県", "", "鳥取市", "", "大字福井", "", "", "", 0, 35.5200, 134.2300
+    ),
     # ABR が全角算用数字で持っている丁目。入力は「二丁目」で来ることがある。
-    _Town(
+    _Machiaza(
         131105,
         13002,
         "東京都",
@@ -84,7 +85,7 @@ _TOWNS = [
         139.6690,
     ),
     # 同一の区に同名の町字が 2 つ（京都の通り名由来）。最長一致が競合する。
-    _Town(
+    _Machiaza(
         261041,
         20000,
         "京都府",
@@ -99,7 +100,7 @@ _TOWNS = [
         35.0100,
         135.7600,
     ),
-    _Town(
+    _Machiaza(
         261041,
         21000,
         "京都府",
@@ -114,7 +115,7 @@ _TOWNS = [
         35.0120,
         135.7620,
     ),
-    _Town(
+    _Machiaza(
         423912,
         1000,
         "長崎県",
@@ -132,7 +133,7 @@ _TOWNS = [
     # ABR が同じ場所を「字○○」と「○○」の 2 レコードに分けて持ち、地番も
     # 両方に割れている型（栗原市築館新田で実測）。代表 1 行に畳み、
     # alt_machiaza にもう一方の machiaza_id を持たせる。
-    _Town(
+    _Machiaza(
         423912,
         2000,
         "長崎県",
@@ -167,22 +168,22 @@ _PREFS = [
 #: 面影一丁目の住居番号。1番1号 と 1番2号 と 2番1号。
 _RSDT = {
     (312011, 55001): [
-        NumberEntry(1, 1, 0, Point(35.47970, 134.24580)),
-        NumberEntry(1, 2, 0, Point(35.47975, 134.24590)),
-        NumberEntry(2, 1, 0, Point(35.47990, 134.24610)),
+        Banchi(1, 1, 0, Point(35.47970, 134.24580)),
+        Banchi(1, 2, 0, Point(35.47975, 134.24590)),
+        Banchi(2, 1, 0, Point(35.47990, 134.24610)),
     ]
 }
 
 #: 佐々町石木場免の地番。1-1 と 1-2 と 2-1。
 _PARCEL = {
     (423912, 1000): [
-        NumberEntry(1, 1, 0, Point(33.25355, 129.66294)),
-        NumberEntry(1, 2, 0, Point(33.25322, 129.66262)),
-        NumberEntry(2, 1, 0, Point(33.25324, 129.66316)),
+        Banchi(1, 1, 0, Point(33.25355, 129.66294)),
+        Banchi(1, 2, 0, Point(33.25322, 129.66262)),
+        Banchi(2, 1, 0, Point(33.25324, 129.66316)),
     ],
     # 字小浦免。代表の machiaza_id に 7 番地、畳んだ側に 120 番地。
-    (423912, 2000): [NumberEntry(7, 0, 0, Point(33.21005, 129.65004))],
-    (423912, 2500): [NumberEntry(120, 0, 0, Point(33.21120, 129.65110))],
+    (423912, 2000): [Banchi(7, 0, 0, Point(33.21005, 129.65004))],
+    (423912, 2500): [Banchi(120, 0, 0, Point(33.21120, 129.65110))],
 }
 
 
@@ -200,42 +201,36 @@ def data_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
             CityRecord(lg_code=lg, pref=pref, county=county, city=city, ward=ward)
             for lg, pref, county, city, ward in _CITIES
         )
-        records: list[TownRecord] = []
+        records: list[MachiazaRecord] = []
         pairs: list[tuple[str, int]] = []
-        for town_id, town in enumerate(_TOWNS):
+        for row_id, machiaza in enumerate(_MACHIAZA):
+            name = MachiazaName(
+                pref=machiaza.pref,
+                county=machiaza.county,
+                city=machiaza.city,
+                ward=machiaza.ward,
+                oaza_cho=machiaza.oaza_cho,
+                chome=machiaza.chome,
+                chome_number=machiaza.chome_number,
+                koaza=machiaza.koaza,
+            )
             records.append(
-                TownRecord(
-                    town_id=town_id,
-                    lg_code=town.lg_code,
-                    machiaza_id=town.machiaza_id,
-                    pref=town.pref,
-                    county=town.county,
-                    city=town.city,
-                    ward=town.ward,
-                    oaza_cho=town.oaza_cho,
-                    chome=town.chome,
-                    koaza=town.koaza,
-                    rsdt_addr_flg=town.rsdt_addr_flg,
-                    point=Point(lat=town.lat, lon=town.lon),
-                    alt_machiaza=town.alt_machiaza,
+                MachiazaRecord(
+                    row_id=row_id,
+                    lg_code=machiaza.lg_code,
+                    machiaza_id=machiaza.machiaza_id,
+                    name=name,
+                    rsdt_addr_flg=machiaza.rsdt_addr_flg,
+                    point=Point(lat=machiaza.lat, lon=machiaza.lon),
+                    alt_machiaza=machiaza.alt_machiaza,
                 )
             )
-            name = TownName(
-                town.pref,
-                town.county,
-                town.city,
-                town.ward,
-                town.oaza_cho,
-                town.chome,
-                town.chome_number,
-                town.koaza,
-            )
-            pairs.extend((alias, town_id) for alias in town_aliases(name))
-        store.replace_towns(records)
-        store.put_numbers_many(
-            [(lg, machiaza, NumberKind.RSDT, entries) for (lg, machiaza), entries in _RSDT.items()]
+            pairs.extend((alias, row_id) for alias in machiaza_aliases(name))
+        store.replace_machiaza(records)
+        store.put_banchi(
+            [(lg, machiaza, BanchiKind.RSDT, entries) for (lg, machiaza), entries in _RSDT.items()]
             + [
-                (lg, machiaza, NumberKind.PARCEL, entries)
+                (lg, machiaza, BanchiKind.PARCEL, entries)
                 for (lg, machiaza), entries in _PARCEL.items()
             ]
         )
@@ -243,12 +238,12 @@ def data_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     finally:
         store.close()
 
-    adapters.tries().save(pairs, adapters.trie_path(path))
+    adapters.trie_backend().save(pairs, adapters.trie_path(path))
     return path
 
 
 @pytest.fixture
-def index(data_dir: Path) -> TownIndex:
+def index(data_dir: Path) -> MachiazaIndex:
     return adapters.open_index(data_dir)
 
 
@@ -267,13 +262,13 @@ class FakeModel:
     calls: list[Sequence[ports.Question]] = field(default_factory=list)
     fail: bool = False
 
-    async def choose(self, questions: Sequence[ports.Question]) -> ports.ChoiceSet:
+    async def choose(self, questions: Sequence[ports.Question]) -> ports.Answers:
         self.calls.append(list(questions))
         if self.fail:
             raise ports.ModelUnavailable("模擬障害")
         usage = Usage()
         usage.add(100, 10)
-        return ports.ChoiceSet(
+        return ports.Answers(
             decisions=[self._decide(i, q) for i, q in enumerate(questions)], usage=usage
         )
 

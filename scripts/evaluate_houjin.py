@@ -40,9 +40,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from jev_abr_geocoder import adapters, ports  # noqa: E402
+from jev_abr_geocoder.address import Granularity  # noqa: E402
 from jev_abr_geocoder.config import GeocoderConfig  # noqa: E402
 from jev_abr_geocoder.geocoder import Geocoder  # noqa: E402
-from jev_abr_geocoder.models import GeocodeResult, Level  # noqa: E402
+from jev_abr_geocoder.outcome import GeocodeResult  # noqa: E402
 
 INPUT_COST_PER_MTOK = 0.042
 
@@ -109,7 +110,7 @@ class CountingModel:
         self.input_tokens = 0
         self.latencies: list[float] = []
 
-    async def choose(self, questions: Sequence[ports.Question]) -> ports.ChoiceSet:
+    async def choose(self, questions: Sequence[ports.Question]) -> ports.Answers:
         started = time.perf_counter()
         result = await self._inner.choose(questions)
         self.latencies.append((time.perf_counter() - started) * 1000)
@@ -124,9 +125,9 @@ class Report:
     elapsed: float = 0.0
     levels: collections.Counter[str] = field(default_factory=collections.Counter)
     resolved: int = 0
-    town_fast_path: int = 0
-    number_fast_path: int = 0
-    beam_requests: int = 0
+    machiaza_fast_path: int = 0
+    banchi_fast_path: int = 0
+    narrow_requests: int = 0
     requests: int = 0
     input_tokens: int = 0
     latencies: list[float] = field(default_factory=list)
@@ -157,9 +158,9 @@ async def run(data_dir: Path, cases: list[Case], cfg: GeocoderConfig, *, use_mod
     started = time.perf_counter()
     with Geocoder.open(data_dir, model=model, cfg=cfg) as geocoder:
         outcome = await geocoder.run_all([c.query for c in cases])
-        report.town_fast_path = outcome.town_fast_path
-        report.number_fast_path = outcome.number_fast_path
-        report.beam_requests = outcome.beam_requests
+        report.machiaza_fast_path = outcome.machiaza_fast_path
+        report.banchi_fast_path = outcome.banchi_fast_path
+        report.narrow_requests = outcome.narrow_requests
         for case, result in zip(cases, outcome.results, strict=True):
             _record(report, case, result)
     report.elapsed = time.perf_counter() - started
@@ -171,23 +172,23 @@ async def run(data_dir: Path, cases: list[Case], cfg: GeocoderConfig, *, use_mod
 
 
 def _record(report: Report, case: Case, result: GeocodeResult) -> None:
-    report.levels[result.level.label] += 1
+    report.levels[result.granularity.label] += 1
     report.resolved += bool(result.resolved)
-    if result.level >= Level.CITY and result.lg_code:
+    if result.granularity >= Granularity.CITY and result.lg_code:
         report.city_checked += 1
         if result.lg_code == case.lg_code:
             report.city_correct += 1
         elif len(report.city_wrong) < 30:
             report.city_wrong.append((case.query, case.lg_code, result.lg_code))
-    if result.level >= Level.BLOCK:
+    if result.granularity >= Granularity.BLOCK:
         report.number_conf.append(result.confidence)
-    elif result.level == Level.MACHIAZA:
+    elif result.granularity == Granularity.MACHIAZA:
         report.town_conf.append(result.confidence)
-        why = result.note or ("番地が入力に無い" if not result.rest else "番号を選べなかった")
+        why = result.note or ("番地が入力に無い" if not result.remainder else "番号を選べなかった")
         report.stopped[why] += 1
         report.stopped_examples.setdefault(why, [])
         if len(report.stopped_examples[why]) < 5:
-            report.stopped_examples[why].append(f"{result.query}  -> 残り {result.rest!r}")
+            report.stopped_examples[why].append(f"{result.query}  -> 残り {result.remainder!r}")
 
 
 def _percentiles(values: list[float]) -> str:
@@ -237,10 +238,12 @@ def print_report(report: Report, title: str) -> None:
     print(f"  番号まで到達      {_percentiles(report.number_conf)}")
     print(f"  町字で止まった    {_percentiles(report.town_conf)}")
 
-    print(f"\nファストパス      町字 {report.town_fast_path:,} / 番号 {report.number_fast_path:,}")
+    print(
+        f"\nファストパス      町字 {report.machiaza_fast_path:,} / 番号 {report.banchi_fast_path:,}"
+    )
     if report.requests:
         lat = sorted(report.latencies)
-        print(f"Jev 往復          {report.requests:,} 回 (うち beam {report.beam_requests:,})")
+        print(f"Jev 往復          {report.requests:,} 回 (うち絞り込み {report.narrow_requests:,})")
         print(f"入力トークン      {report.input_tokens:,}")
         per_k = report.cost / report.total * 1000
         print(f"概算コスト        ${report.cost:.4f}  (${per_k:.4f} / 1,000 件)")
@@ -273,7 +276,7 @@ def main() -> None:
     cfg = GeocoderConfig(
         batch_size=args.batch_size,
         concurrency=args.concurrency,
-        always_rerank=args.always_rerank,
+        always_ask=args.always_ask,
     )
     report = asyncio.run(run(args.data_dir, cases, cfg, use_model=args.model))
     print_report(report, "Jev あり" if args.model else "Jev なし（トライのみ）")

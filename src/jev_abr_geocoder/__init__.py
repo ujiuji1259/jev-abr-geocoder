@@ -15,9 +15,11 @@
 
 from . import ports
 from ._version import __version__
+from .address import BanchiKind, Granularity, Point
 from .config import GeocoderConfig
+from .decision import Decision
 from .geocoder import Geocoder
-from .models import Decision, GeocodeResult, Level, NumberKind, Point
+from .outcome import GeocodeResult
 
 __all__ = [
     "__version__",
@@ -25,8 +27,8 @@ __all__ = [
     "GeocoderConfig",
     "GeocodeResult",
     "Decision",
-    "Level",
-    "NumberKind",
+    "Granularity",
+    "BanchiKind",
     "Point",
     "ports",
 ]

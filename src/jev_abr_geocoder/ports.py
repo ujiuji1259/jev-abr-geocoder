@@ -24,27 +24,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from .models import (
-    CityRecord,
-    Decision,
-    NumberEntry,
-    NumberKind,
-    PrefRecord,
-    TownRecord,
-    Usage,
-)
+from .address import Banchi, BanchiKind, CityRecord, MachiazaRecord, PrefRecord
+from .decision import Decision, Usage
 
 __all__ = [
     "HttpError",
     "HttpResponse",
     "HttpClient",
     "PrefixTrie",
-    "TrieFactory",
-    "NumberSource",
+    "TrieBackend",
+    "BanchiSource",
     "IndexReader",
     "IndexWriter",
     "Question",
-    "ChoiceSet",
+    "Answers",
     "DecisionModel",
     "ModelUnavailable",
 ]
@@ -112,7 +105,7 @@ class PrefixTrie(Protocol):
     鍵は正規化済みのエイリアス、値は町字・市区町村への整数 ID。
     """
 
-    def prefixes(self, text: str) -> list[tuple[str, int]]:
+    def prefixes_of(self, text: str) -> list[tuple[str, int]]:
         """``text`` の先頭に一致する (鍵, 値) をすべて返す。順序は問わない。
 
         1 つの鍵に複数の値が付いていることがある（同名の町字）ので、
@@ -120,12 +113,12 @@ class PrefixTrie(Protocol):
         """
         ...
 
-    def under(self, prefix: str, limit: int) -> list[tuple[str, int]]:
+    def extensions_of(self, prefix: str, limit: int) -> list[tuple[str, int]]:
         """``prefix`` で始まる鍵を高々 ``limit`` 組返す。"""
         ...
 
 
-class TrieFactory(Protocol):
+class TrieBackend(Protocol):
     """トライの作成と読み込み。永続化の形式はアダプタが決める。"""
 
     def load(self, path: Path) -> PrefixTrie:
@@ -148,7 +141,7 @@ class TrieFactory(Protocol):
 # ------------------------------------------------------------------ 永続化
 
 
-class NumberSource(Protocol):
+class BanchiSource(Protocol):
     """層2 の番号だけを引く口。
 
     :class:`IndexReader` はこれを満たす。:mod:`match.numbers` はこちらしか
@@ -156,14 +149,14 @@ class NumberSource(Protocol):
     テストの偽物も 1 メソッドで済む。
     """
 
-    def fetch_numbers(
+    def fetch_banchi(
         self,
         lg_code: int,
         machiaza_id: int,
-        kind: NumberKind,
+        kind: BanchiKind,
         *,
         num1: int | None = None,
-    ) -> list[NumberEntry]:
+    ) -> list[Banchi]:
         """町字配下の番号を返す。
 
         ``num1`` を与えたら、その番号を含む範囲だけを展開してよい（町字の
@@ -172,7 +165,7 @@ class NumberSource(Protocol):
         ...
 
 
-class IndexReader(NumberSource, Protocol):
+class IndexReader(BanchiSource, Protocol):
     """索引の読み取り。プロセス間で安全に共有できること。
 
     層1 のレコードと層2 の番号を引く。**ここに出入りするのはすべて
@@ -183,7 +176,7 @@ class IndexReader(NumberSource, Protocol):
 
     def cities(self) -> list[CityRecord]: ...
 
-    def towns(self, town_ids: Sequence[int]) -> dict[int, TownRecord]:
+    def machiaza(self, row_ids: Sequence[int]) -> dict[int, MachiazaRecord]:
         """町字を一括で引く。候補を絞ったあとにだけ呼ばれる。"""
         ...
 
@@ -191,9 +184,9 @@ class IndexReader(NumberSource, Protocol):
         """索引のメタデータ。版・構築日時・帰属表示など。"""
         ...
 
-    def town_count(self) -> int: ...
+    def machiaza_count(self) -> int: ...
 
-    def number_count(self) -> int: ...
+    def banchi_count(self) -> int: ...
 
     def sources(self) -> dict[str, str | None]:
         """取り込み済みソース URL -> ``Last-Modified``。"""
@@ -215,11 +208,9 @@ class IndexWriter(Protocol):
 
     def replace_cities(self, records: Iterable[CityRecord]) -> None: ...
 
-    def replace_towns(self, records: Iterable[TownRecord]) -> None: ...
+    def replace_machiaza(self, records: Iterable[MachiazaRecord]) -> None: ...
 
-    def put_numbers_many(
-        self, items: Iterable[tuple[int, int, NumberKind, Sequence[NumberEntry]]]
-    ) -> int:
+    def put_banchi(self, items: Iterable[tuple[int, int, BanchiKind, Sequence[Banchi]]]) -> int:
         """まとめて書く。戻り値は書いた町字数。"""
         ...
 
@@ -266,11 +257,11 @@ class Question:
     label: str
     #: 質問文が名前で参照する :attr:`subject` のラベル。
     #: 「`町字` より後ろ」のように質問が材料を指すときに要る。
-    cite: Sequence[str] = ()
+    refers_to: Sequence[str] = ()
 
 
 @dataclass(frozen=True, slots=True)
-class ChoiceSet:
+class Answers:
     #: 渡した問と同じ順・同じ長さ。答えが得られなかった問は ``index=None``。
     decisions: Sequence[Decision]
     usage: Usage
@@ -283,7 +274,7 @@ class DecisionModel(Protocol):
     無いと Jev 無しでは何も検証できなくなる（docs/code-design.md §6）。
     """
 
-    async def choose(self, questions: Sequence[Question]) -> ChoiceSet:
+    async def choose(self, questions: Sequence[Question]) -> Answers:
         """**全問を 1 リクエストで**答える。
 
         1 問ずつ呼ぶ実装にしてはならない。入力が何件でも往復を高々 2 回に

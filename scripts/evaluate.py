@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from jev_abr_geocoder import adapters, ports  # noqa: E402
 from jev_abr_geocoder.config import GeocoderConfig  # noqa: E402
 from jev_abr_geocoder.geocoder import Geocoder  # noqa: E402
-from jev_abr_geocoder.models import GeocodeResult  # noqa: E402
+from jev_abr_geocoder.outcome import GeocodeResult  # noqa: E402
 from jev_abr_geocoder.textnorm import normalize  # noqa: E402
 
 #: Jev の入力トークン単価（出力は無料）。https://typesafe.ai/blog/...
@@ -62,7 +62,7 @@ class CountingModel:
         self.output_tokens = 0
         self.latencies: list[float] = []
 
-    async def choose(self, questions: Sequence[ports.Question]) -> ports.ChoiceSet:
+    async def choose(self, questions: Sequence[ports.Question]) -> ports.Answers:
         started = time.perf_counter()
         result = await self._inner.choose(questions)
         self.latencies.append((time.perf_counter() - started) * 1000)
@@ -78,8 +78,8 @@ class Report:
     elapsed: float = 0.0
     levels: collections.Counter[str] = field(default_factory=collections.Counter)
     resolved: int = 0
-    town_fast_path: int = 0
-    number_fast_path: int = 0
+    machiaza_fast_path: int = 0
+    banchi_fast_path: int = 0
     requests: int = 0
     input_tokens: int = 0
     latencies: list[float] = field(default_factory=list)
@@ -147,7 +147,7 @@ def load_silver(path: Path) -> dict[str, str]:
 
 
 def _predicted_town(result: GeocodeResult) -> str:
-    return comparable(result.pref + result.county + result.city + result.ward + result.town)
+    return comparable(result.pref + result.county + result.city + result.ward + result.machiaza)
 
 
 # ------------------------------------------------------------------ 実行
@@ -171,10 +171,10 @@ async def run(
     started = time.perf_counter()
     with Geocoder.open(data_dir, model=model, cfg=cfg) as geocoder:
         outcome = await geocoder.run_all(queries)
-        report.town_fast_path = outcome.town_fast_path
-        report.number_fast_path = outcome.number_fast_path
+        report.machiaza_fast_path = outcome.machiaza_fast_path
+        report.banchi_fast_path = outcome.banchi_fast_path
         for query, result in zip(queries, outcome.results, strict=True):
-            report.levels[result.level.label] += 1
+            report.levels[result.granularity.label] += 1
             report.resolved += bool(result.resolved)
             if silver is not None and query in silver:
                 expected = silver[query]
@@ -203,7 +203,7 @@ def print_report(report: Report, title: str) -> None:
     for level, count in sorted(report.levels.items(), key=lambda kv: -kv[1]):
         print(f"  {level:8} {count:7,}  {count / report.total:6.1%}")
     print(f"\nresolved=True   {report.resolved:,} ({report.resolved / report.total:.1%})")
-    print(f"ファストパス    町字 {report.town_fast_path:,} / 番号 {report.number_fast_path:,}")
+    print(f"ファストパス    町字 {report.machiaza_fast_path:,} / 番号 {report.banchi_fast_path:,}")
     if report.requests:
         lat = sorted(report.latencies)
         print(f"\nJev 往復        {report.requests:,} 回")
@@ -259,7 +259,7 @@ def main() -> None:
     silver = load_silver(args.silver) if args.silver else None
 
     if not args.sweep:
-        cfg = GeocoderConfig(batch_size=args.batch_size, always_rerank=args.always_rerank)
+        cfg = GeocoderConfig(batch_size=args.batch_size, always_ask=args.always_ask)
         report = asyncio.run(run(args.data_dir, queries, cfg, use_model=args.model, silver=silver))
         print_report(report, "Jev あり" if args.model else "Jev なし（トライのみ）")
         if args.jsonl:
@@ -284,9 +284,9 @@ def main() -> None:
     for threshold in (0.0, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95):
         cfg = GeocoderConfig(
             batch_size=args.batch_size,
-            always_rerank=args.always_rerank,
-            town_confidence=threshold,
-            number_confidence=threshold,
+            always_ask=args.always_ask,
+            machiaza_confidence=threshold,
+            banchi_confidence=threshold,
         )
         report = asyncio.run(run(args.data_dir, queries, cfg, use_model=args.model, silver=silver))
         coverage = report.resolved / report.total

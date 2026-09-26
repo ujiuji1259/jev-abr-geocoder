@@ -4,7 +4,7 @@
 ポート                                    実装                   ライブラリ
 ======================================  ===================  ==============
 ``IndexReader`` / ``IndexWriter``        ``SqliteStore``      ``sqlite3``
-``PrefixTrie`` / ``TrieFactory``         ``MarisaTries``      ``marisa-trie``
+``PrefixTrie`` / ``TrieBackend``         ``MarisaBackend``      ``marisa-trie``
 ``DecisionModel``                       ``JevModel``         ``typesafe-sdk``
 ``HttpClient``                          ``HttpxClient``      ``httpx``
 ======================================  ===================  ==============
@@ -20,10 +20,10 @@ from pathlib import Path
 
 from .. import ports
 from ..config import GeocoderConfig
-from ..index.townindex import TownIndex
+from ..index.machiaza_index import MachiazaIndex
 from .http import HttpxClient
 from .jev import JevModel
-from .marisa import TRIE_FILENAME, MarisaTries
+from .marisa import TRIE_FILENAME, MarisaBackend
 from .sqlite import DB_FILENAME, SCHEMA_VERSION, SqliteStore
 
 __all__ = [
@@ -32,10 +32,10 @@ __all__ = [
     "TRIE_FILENAME",
     "HttpxClient",
     "JevModel",
-    "MarisaTries",
+    "MarisaBackend",
     "SqliteStore",
     "http_client",
-    "tries",
+    "trie_backend",
     "index_path",
     "trie_path",
     "open_reader",
@@ -49,8 +49,8 @@ def http_client() -> ports.HttpClient:
     return HttpxClient()
 
 
-def tries() -> ports.TrieFactory:
-    return MarisaTries()
+def trie_backend() -> ports.TrieBackend:
+    return MarisaBackend()
 
 
 def index_path(data_dir: Path) -> Path:
@@ -71,12 +71,12 @@ def create_writer(data_dir: Path) -> ports.IndexWriter:
     return SqliteStore.create(data_dir / DB_FILENAME)
 
 
-def open_index(data_dir: Path) -> TownIndex:
+def open_index(data_dir: Path) -> MachiazaIndex:
     """層1 を開く。トライを mmap し、レコードを読み取り専用で開く。"""
-    factory = MarisaTries()
-    return TownIndex(
+    factory = MarisaBackend()
+    return MachiazaIndex(
         trie=factory.load(data_dir / TRIE_FILENAME),
-        store=open_reader(data_dir),
+        reader=open_reader(data_dir),
         tries=factory,
     )
 
