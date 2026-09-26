@@ -261,7 +261,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--model", action="store_true", help="Jev を使う")
     parser.add_argument(
-        "--always-rerank",
+        "--always-ask",
         action="store_true",
         help="ファストパスを無効化して全件 Jev を通す（閾値を測るとき用）",
     )

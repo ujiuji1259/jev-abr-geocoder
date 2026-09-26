@@ -239,7 +239,7 @@ def main() -> None:
     parser.add_argument("--silver", type=Path, help="geolonia の addresses.csv")
     parser.add_argument("--limit", type=int, help="先頭 N 件だけ")
     parser.add_argument("--model", action="store_true", help="Jev を使う")
-    parser.add_argument("--always-rerank", action="store_true", help="ファストパスを無効化")
+    parser.add_argument("--always-ask", action="store_true", help="ファストパスを無効化")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument(
         "--sweep", action="store_true", help="confidence 閾値を振って精度-カバレッジを出す"

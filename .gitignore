@@ -8,3 +8,6 @@ __pycache__/
 *.marisa
 *.db
 data/
+
+# 資格情報。winnow の Secret から落としたもの
+.env
