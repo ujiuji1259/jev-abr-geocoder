@@ -63,6 +63,11 @@ class _TownRow:
     lat_1e7: int | None
     lon_1e7: int | None
     source: str = "abr"
+    #: ABR の ``chome_number`` 列。丁目の漢数字・算用数字の別名を作るのに要る。
+    #: ``machiaza_id`` の下 3 桁からは復元できない（丁目でない枝番も同じ桁を
+    #: 使うため、全国 727,429 行のうち 526,344 行でずれる）。
+    #: 索引を作る間だけ要るので ``as_tuple`` には出さない。
+    chome_number: str = ""
 
     def as_tuple(self) -> tuple[object, ...]:
         return (
@@ -93,6 +98,8 @@ class BuildReport:
     cities: int = 0
     towns: int = 0
     geolonia_towns: int = 0
+    #: ABR に既にあったので行を足さず別名だけ足した Geolonia の町字。
+    geolonia_merged: int = 0
     trie_keys: int = 0
     numbers: int = 0
     elapsed: float = 0.0
@@ -218,10 +225,10 @@ def _build_towns(
     text: Sequence[Path],
     pos: Sequence[Path],
     geolonia_csv: Path | None = None,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int]:
     """``town`` テーブルと ``town.marisa`` を作る。
 
-    ``(町字数, 鍵数, geolonia から補った数)`` を返す。
+    ``(町字数, 鍵数, geolonia から補った数, geolonia を畳んだ数)`` を返す。
     """
     positions = _load_town_positions(pos)
     rows: list[_TownRow] = []
@@ -289,12 +296,13 @@ def _build_towns(
                     rsdt_addr_flg=flg,
                     lat_1e7=lat,
                     lon_1e7=lon,
+                    chome_number=name.chome_number,
                 )
             )
             payload = (town_id,)
             pairs.extend((alias, payload) for alias in aliases)
 
-    added = _add_geolonia_towns(rows, pairs, geolonia_csv) if geolonia_csv else 0
+    added, merged = _add_geolonia_towns(rows, pairs, geolonia_csv) if geolonia_csv else (0, 0)
 
     store.replace_towns([r.as_tuple() for r in rows])
 
@@ -303,12 +311,12 @@ def _build_towns(
     tmp = data_dir / f"{TRIE_FILENAME}.tmp"
     trie.save(str(tmp))
     tmp.replace(data_dir / TRIE_FILENAME)
-    return len(rows), len(pairs), added
+    return len(rows), len(pairs), added, merged
 
 
 def _add_geolonia_towns(
     rows: list[_TownRow], pairs: list[tuple[str, tuple[int]]], csv_path: Path
-) -> int:
+) -> tuple[int, int]:
     """ABR に無い町字を Geolonia 住所データから補う。
 
     ABR は丁目や小字を持つ大字について、**大字そのものの行を持たないことが
@@ -318,32 +326,39 @@ def _add_geolonia_towns(
 
     補った行は ``machiaza_id`` を持たないので層2（街区・住居番号・地番）は
     引けない。町字までで止まり、残りは未解決部分として返る。
+
+    **既に ABR にある町字は行を足さず、別名だけ足す。** 同じ場所を ABR が
+    「字新田」、Geolonia が「新田」と持っていることが多く（実測 62,166 件中
+    50,267 件）、別行にすると 1 つの鍵が 2 つの町字を指してしまう。Jev に
+    同じ選択肢を 2 つ見せることになるうえ、鍵あたり 1 値で済まなくなる。
+    照合鍵は :func:`_match_key` で大字・字を落としてから比べる。
     """
     # ABR 側の照合表。ケ/ヶ の揺れは索引側エイリアスが吸収するので、
     # ここでも同じ土俵に乗せてから比べる。
-    seen = {
-        _match_key(r.pref + r.county + r.city + r.ward, r.oaza_cho + r.chome + r.koaza)
-        for r in rows
-    }
+    seen: dict[str, int] = {}
+    for r in rows:
+        seen.setdefault(
+            _match_key(r.pref + r.county + r.city + r.ward, r.oaza_cho, r.chome, r.koaza),
+            r.town_id,
+        )
+    #: 別名を足した先の町字が既に持っている鍵。同じ (鍵, 町字) を二重に
+    #: 登録しないため。畳んだ分だけしか作らないので小さい。
+    grown: dict[int, set[str]] = {}
     # 市区町村ごとの lg_code。geolonia は市区町村コードを持つが、
     # ABR の lg_code とは桁が違うので名前で引く。
     lg_by_city: dict[str, int] = {}
     names_by_city: dict[str, tuple[str, str, str, str]] = {}
     for r in rows:
-        city_key = _match_key(r.pref + r.county + r.city + r.ward, "")
+        city_key = _match_key(r.pref + r.county + r.city + r.ward)
         lg_by_city.setdefault(city_key, r.lg_code)
         names_by_city.setdefault(city_key, (r.pref, r.county, r.city, r.ward))
 
-    added = 0
+    added = merged = 0
     for town in geolonia.read_rows(csv_path):
-        city_key = _match_key(town.pref + town.city, "")
+        city_key = _match_key(town.pref + town.city)
         lg_code = lg_by_city.get(city_key)
         if lg_code is None:
             continue
-        key = _match_key(town.pref + town.city, town.town + town.koaza)
-        if key in seen:
-            continue
-        seen.add(key)
 
         pref, county, city, ward = names_by_city[city_key]
         name = TownName(
@@ -359,7 +374,25 @@ def _add_geolonia_towns(
         aliases = town_aliases(name)
         if not aliases:
             continue
+
+        key = _match_key(town.pref + town.city, town.town, "", town.koaza)
+        owner = seen.get(key)
+        if owner is not None:
+            # 同じ場所。行は足さず、この表記の鍵だけ ABR の町字に向ける。
+            already = grown.setdefault(owner, town_aliases(_name_of(rows[owner])))
+            payload = (owner,)
+            pairs.extend((alias, payload) for alias in aliases - already)
+            already |= aliases
+            merged += 1
+            # ABR の位置参照は町字をすべては覆っていない。空いていれば埋める。
+            held = rows[owner]
+            if held.lat_1e7 is None and town.lat is not None and town.lon is not None:
+                held.lat_1e7 = round(town.lat * _COORD_SCALE)
+                held.lon_1e7 = round(town.lon * _COORD_SCALE)
+            continue
+
         town_id = len(rows)
+        seen[key] = town_id
         rows.append(
             _TownRow(
                 town_id=town_id,
@@ -382,7 +415,7 @@ def _add_geolonia_towns(
         payload = (town_id,)
         pairs.extend((alias, payload) for alias in aliases)
         added += 1
-    return added
+    return added, merged
 
 
 #: ABR と Geolonia を突き合わせるための鍵。丁目の漢数字・算用数字の違いと
@@ -390,10 +423,35 @@ def _add_geolonia_towns(
 #: 「旭ケ丘一丁目」のように持ち方が違う。
 _KANJI_RUN = re.compile(r"([〇零一二三四五六七八九十百千]+)")
 _KANA_FOLD = str.maketrans({"ヶ": "ケ", "ガ": "ケ", "が": "ケ"})
+#: 大字・字の接頭辞。どちらのデータが付けているかは町字ごとにまちまち。
+_TOWN_PREFIX = re.compile(r"^(大字|字)")
 
 
-def _match_key(city: str, town: str) -> str:
-    return normalize(city + _fold_numbers(town)).translate(_KANA_FOLD)
+def _match_key(city: str, *parts: str) -> str:
+    """ABR と Geolonia の町字を突き合わせる鍵。
+
+    大字・字は **段ごとに落としてから** つなぐ。ABR が
+    ``oaza_cho='古川清水', koaza='字新田'``、Geolonia が
+    ``town='古川清水', koaza='新田'`` のように持つので、つないでから
+    落とすと「字」が中に残って一致しない。段の切り方自体がずれている
+    （ABR が大字＋小字、Geolonia が大字ひとつ）場合も、つないだ結果が
+    同じなら同じ場所とみなす。
+    """
+    folded = "".join(_TOWN_PREFIX.sub("", _fold_numbers(p)) for p in parts)
+    return normalize(city + folded).translate(_KANA_FOLD)
+
+
+def _name_of(row: _TownRow) -> TownName:
+    return TownName(
+        pref=row.pref,
+        county=row.county,
+        city=row.city,
+        ward=row.ward,
+        oaza_cho=row.oaza_cho,
+        chome=row.chome,
+        chome_number=row.chome_number,
+        koaza=row.koaza,
+    )
 
 
 def _fold_numbers(text: str) -> str:
@@ -600,16 +658,22 @@ async def build(
                 except Exception as exc:  # noqa: BLE001 - 補完なので失敗しても続ける
                     report.notes.append(f"Geolonia 住所データを取得できなかった: {exc}")
             notify("layer1", 2, 3, "町字とトライ")
-            report.towns, report.trie_keys, report.geolonia_towns = _build_towns(
+            (
+                report.towns,
+                report.trie_keys,
+                report.geolonia_towns,
+                report.geolonia_merged,
+            ) = _build_towns(
                 store,
                 data_dir,
                 [d.path for d in by_kind["mt_town"]],
                 [d.path for d in by_kind.get("mt_town_pos", [])],
                 geolonia_csv,
             )
-            if report.geolonia_towns:
+            if report.geolonia_towns or report.geolonia_merged:
                 store.set_meta("geolonia_attribution", geolonia.ATTRIBUTION)
                 store.set_meta("geolonia_towns", str(report.geolonia_towns))
+                store.set_meta("geolonia_merged", str(report.geolonia_merged))
         notify("layer1", 3, 3, "完了")
         store.commit()
 

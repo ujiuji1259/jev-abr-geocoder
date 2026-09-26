@@ -90,7 +90,8 @@ def build(
                 f"都道府県      : {report.prefs:,}",
                 f"市区町村      : {report.cities:,}",
                 f"町字          : {report.towns:,}  (索引鍵 {report.trie_keys:,})",
-                f"  うち Geolonia: {report.geolonia_towns:,}",
+                f"  うち Geolonia: {report.geolonia_towns:,} "
+                f"(既存に畳んだ別名 {report.geolonia_merged:,})",
                 f"番号          : {report.numbers:,}",
                 f"所要          : {report.elapsed:.1f} 秒",
             ]
