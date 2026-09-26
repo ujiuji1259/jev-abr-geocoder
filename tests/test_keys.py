@@ -40,10 +40,27 @@ def test_town_aliases_cover_chome_forms() -> None:
 
 def test_town_aliases_cover_oaza_and_koaza_prefixes() -> None:
     aliases = town_aliases(TownName("鳥取県", "", "鳥取市", "", "大字福井", "", "", "字上町"))
-    assert "鳥取県鳥取市大字福井字上町" in aliases
+    assert "鳥取県鳥取市大字福井字上町" in aliases  # 原文どおり
     assert "鳥取県鳥取市福井上町" in aliases  # 大字・字ともに省略
-    assert "鳥取県鳥取市福井字上町" in aliases
-    assert "鳥取県鳥取市大字福井上町" in aliases
+
+
+def test_town_aliases_do_not_mix_prefix_styles() -> None:
+    """大字だけ書いて字は省く、という書き方は実在しないので張らない。
+
+    接頭辞を直積の軸にすると、両方に接頭辞がある町字（全国 57,033 件）が
+    4 通りに膨らむ。全国で鍵が 411,259 本（7.9%）増えるのに、評価セット
+    2 つで候補集合は 1 件も変わらなかった。
+    """
+    aliases = town_aliases(TownName("鳥取県", "", "鳥取市", "", "大字福井", "", "", "字上町"))
+    assert "鳥取県鳥取市福井字上町" not in aliases
+    assert "鳥取県鳥取市大字福井上町" not in aliases
+
+
+def test_oaza_column_may_carry_the_koaza_prefix() -> None:
+    """ABR は大字の列にも「字」を入れてくる（全国 21,315 件）。"""
+    aliases = town_aliases(TownName("北海道", "虻田郡", "真狩村", "", "字光", "", "", ""))
+    assert "北海道虻田郡真狩村字光" in aliases
+    assert "北海道虻田郡真狩村光" in aliases
 
 
 def test_town_aliases_always_contain_full_form() -> None:

@@ -31,7 +31,9 @@ _PREF_SUFFIXES = ("都", "道", "府", "県")
 
 #: 大字・字の接頭辞。ABR では 78,035 件の oaza_cho が「大字」で、
 #: 254,638 件の koaza が「字」で始まるが、入力では落ちることが多い。
-_OAZA_PREFIXES = ("大字",)
+#: ABR は大字の列にも「字」を入れてくることがある（全国 21,315 件）。
+#: 長い方から試す。
+_OAZA_PREFIXES = ("大字", "字")
 _KOAZA_PREFIXES = ("字",)
 
 
@@ -155,20 +157,40 @@ def city_aliases(name: CityName) -> set[str]:
 def town_aliases(name: TownName) -> set[str]:
     """町字を指す鍵をすべて返す。
 
-    都道府県 (3) x 郡 (1-2) x 大字 (1-2) x 丁目 (1-3) x 字 (1-2) の直積。
-    完全表記 (すべて原文) は必ず含まれる。
+    都道府県 (3) x 郡 (1-2) x 丁目 (1-3) の直積を、**大字・字の接頭辞の
+    付け方 2 通り**（原文そのまま / 全部落とす）それぞれについて作る。
+
+    接頭辞を直積の軸にしない。「大字は原文どおり書くが字は省く」のような
+    混ぜ方は実在しないので、軸にすると引かれない鍵が増えるだけ。実測で
+    大字・字の両方に接頭辞がある町字が 57,033 件 (7.7%) あり、そこが
+    4 通りに膨らんでいた。
     """
     out: set[str] = set()
-    oazas = _strip_variants(name.oaza_cho, _OAZA_PREFIXES)
     chomes = _chome_variants(name.chome, name.chome_number)
-    koazas = _strip_variants(name.koaza, _KOAZA_PREFIXES)
     cores = _city_cores(name.city_name)
-    for pref in pref_variants(name.pref):
-        for core in cores:
-            for oaza in oazas:
+    prefs = pref_variants(name.pref)
+    for oaza, koaza in _prefix_styles(name.oaza_cho, name.koaza):
+        for pref in prefs:
+            for core in cores:
                 for chome in chomes:
-                    for koaza in koazas:
-                        key = normalize(pref + core + oaza + chome + koaza)
-                        if key:
-                            out.add(key)
+                    key = normalize(pref + core + oaza + chome + koaza)
+                    if key:
+                        out.add(key)
     return out
+
+
+def _prefix_styles(oaza: str, koaza: str) -> tuple[tuple[str, str], ...]:
+    """大字・字の接頭辞の付け方。原文そのままと、どちらも落とした形。
+
+    >>> _prefix_styles("大字福井", "字上町")
+    (('大字福井', '字上町'), ('福井', '上町'))
+    >>> _prefix_styles("福井", "")
+    (('福井', ''),)
+    """
+    stripped = (
+        _strip_variants(oaza, _OAZA_PREFIXES)[-1],
+        _strip_variants(koaza, _KOAZA_PREFIXES)[-1],
+    )
+    if stripped == (oaza, koaza):
+        return ((oaza, koaza),)
+    return ((oaza, koaza), stripped)
