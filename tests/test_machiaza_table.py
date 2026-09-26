@@ -44,8 +44,10 @@ def _row(
     )
 
 
-def _geolonia(town: str, *, lat: float | None = None, lon: float | None = None) -> GeoloniaTown:
-    return GeoloniaTown(pref="鳥取県", city="鳥取市", town=town, koaza="", lat=lat, lon=lon)
+def _geolonia(
+    town: str, *, koaza: str = "", lat: float | None = None, lon: float | None = None
+) -> GeoloniaTown:
+    return GeoloniaTown(pref="鳥取県", city="鳥取市", town=town, koaza=koaza, lat=lat, lon=lon)
 
 
 def _table(rows: Sequence[MachiazaRow]) -> MachiazaTable:
@@ -87,6 +89,28 @@ def test_prefix_only_difference_is_the_same_place() -> None:
     # 畳んだ側の表記でも引ける。
     assert "鳥取県鳥取市字青野" in _keys_of(table, 0)
     assert "鳥取県鳥取市青野" in _keys_of(table, 0)
+
+
+def test_bare_prefix_is_not_a_name() -> None:
+    """ABR には印だけが入った行が実在する（愛知県知立市知立町の ``koaza='大字'``）。
+
+    名前ではなく記入のゆらぎなので同じ場所に畳む。畳まないと「知立町大字」という
+    実在しない町字が索引に残り、判定モデルに選択肢として並ぶ。
+    """
+    table = _table([_row(56000, "知立町"), _row(56101, "知立町", koaza="大字")])
+
+    assert len(table.records) == 1
+    assert table.records[0].machiaza_ids == (56000, 56101)
+    assert table.stats.folded == 1
+
+
+def test_geolonia_bare_prefix_merges_too() -> None:
+    """石川県かほく市谷の ``koaza='字'``（Geolonia 側）も同じ扱い。"""
+    table = _table([_row(27101, "谷")])
+    table.add_geolonia([_geolonia("谷", koaza="字")])
+
+    assert len(table.records) == 1
+    assert table.stats.geolonia_merged == 1
 
 
 def test_no_key_is_registered_twice() -> None:

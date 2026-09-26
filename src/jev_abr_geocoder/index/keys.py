@@ -91,15 +91,31 @@ _KANA_FOLD = str.maketrans({"ヶ": "ケ", "ガ": "ケ", "が": "ケ"})
 
 
 def without_prefix(value: str) -> str:
-    """大字・字の接頭辞を落とす。
+    """大字・字の接頭辞を落とす。**同じ場所かどうかを見るための鍵に使う。**
 
     >>> without_prefix("大字福井"), without_prefix("字上町"), without_prefix("青野")
     ('福井', '上町', '青野')
 
     「大字」「字」は小字であることを示す構造の印で名前の一部ではないので、
-    **同じ場所かどうかを見るときは落としてから比べる。**
+    同じ場所かどうかを見るときは落としてから比べる。
+
+    **値が接頭辞そのものでも落とす。**
+
+    >>> without_prefix("大字"), without_prefix("字")
+    ('', '')
+
+    ABR には ``oaza_cho='大字'``（青森県つがる市）や ``koaza='大字'``（愛知県
+    知立市知立町）のように、印だけが入った行が実在する。名前ではなく記入の
+    ゆらぎなので、落として同じ場所に畳む。落とさないと「知立町大字」という
+    実在しない町字が索引に残る。
+
+    :func:`_strip_variants`（エイリアス生成用）はこの場合に落とさない。あちらは
+    鍵を作るので、名前が消えた「大字」だけの鍵を生やすわけにはいかない。
     """
-    return _strip_variants(value, _OAZA_PREFIXES)[-1]
+    for prefix in _OAZA_PREFIXES:
+        if value.startswith(prefix):
+            return value[len(prefix) :]
+    return value
 
 
 def match_key(city: str, *parts: str) -> str:
