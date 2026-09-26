@@ -50,6 +50,13 @@ class GeocodeResult:
     prc_id: str = ""
 
     point: Point | None = None
+    #: 座標が**何の代表点か**。``granularity`` より粗いことがある。
+    #:
+    #: ABR は町字の代表点をすべて持っておらず（全国 730,807 町字のうち 442,178 件、
+    #: うち 96% は小字レベル）、無いときは市区町村の代表点で代用する。そのとき
+    #: ``granularity`` は町字のままなので、**これが無いと呼び出し側から代用を
+    #: 見分けられない**。郵便番号データ 3,000 件では 5.3% がこの状態だった。
+    point_granularity: Granularity = Granularity.UNKNOWN
     confidence: float = 0.0
     probability: float = 0.0
     note: str = ""
@@ -57,6 +64,11 @@ class GeocodeResult:
     @property
     def address(self) -> str:
         return f"{self.pref}{self.county}{self.city}{self.ward}{self.machiaza}{self.banchi}"
+
+    @property
+    def point_is_coarser(self) -> bool:
+        """座標が答えより粗い代表点か。地図に置く用途ではここで弾く。"""
+        return self.point is not None and self.point_granularity < self.granularity
 
     @property
     def lat(self) -> float | None:
@@ -88,6 +100,7 @@ class GeocodeResult:
             "prc_id": self.prc_id or None,
             "lat": self.lat,
             "lon": self.lon,
+            "point_granularity": self.point_granularity.name.lower(),
             "confidence": round(self.confidence, 4),
             "probability": round(self.probability, 4),
             "note": self.note or None,

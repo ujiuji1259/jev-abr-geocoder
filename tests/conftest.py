@@ -41,8 +41,9 @@ class _Machiaza:
     chome_number: str
     koaza: str
     rsdt_addr_flg: int
-    lat: float
-    lon: float
+    #: ABR の代表点。持たない町字が全国 442,178 件あるので None を取る。
+    lat: float | None
+    lon: float | None
     #: 同じ場所の別レコードの machiaza_id。
     alt_machiaza: tuple[int, ...] = ()
 
@@ -130,6 +131,11 @@ _MACHIAZA = [
         33.2535,
         129.6629,
     ),
+    # ABR に代表点が無い町字（全国 442,178 件、96% は小字レベル）。
+    # 市区町村の代表点で代用され、point_granularity が CITY になる。
+    _Machiaza(
+        312011, 96000, "鳥取県", "", "鳥取市", "", "青谷町", "", "", "字杉下", 0, None, None
+    ),
     # ABR が同じ場所を「字○○」と「○○」の 2 レコードに分けて持ち、地番も
     # 両方に割れている型（栗原市築館新田で実測）。代表 1 行に畳み、
     # alt_machiaza にもう一方の machiaza_id を持たせる。
@@ -151,11 +157,12 @@ _MACHIAZA = [
     ),
 ]
 
+#: (lg_code, 都道府県, 郡, 市区町村, 区, 代表点)。町字の代表点が無いときの代用元。
 _CITIES = [
-    (312011, "鳥取県", "", "鳥取市", ""),
-    (423912, "長崎県", "北松浦郡", "佐々町", ""),
-    (131105, "東京都", "", "目黒区", ""),
-    (261041, "京都府", "", "京都市", "中京区"),
+    (312011, "鳥取県", "", "鳥取市", "", Point(35.5011, 134.2351)),
+    (423912, "長崎県", "北松浦郡", "佐々町", "", Point(33.2237, 129.6699)),
+    (131105, "東京都", "", "目黒区", "", Point(35.6414, 139.6982)),
+    (261041, "京都府", "", "京都市", "中京区", Point(35.0110, 135.7550)),
 ]
 
 _PREFS = [
@@ -198,8 +205,10 @@ def data_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
             for lg, name, lat, lon in _PREFS
         )
         store.replace_cities(
-            CityRecord(lg_code=lg, pref=pref, county=county, city=city, ward=ward)
-            for lg, pref, county, city, ward in _CITIES
+            CityRecord(
+                lg_code=lg, pref=pref, county=county, city=city, ward=ward, point=point
+            )
+            for lg, pref, county, city, ward, point in _CITIES
         )
         records: list[MachiazaRecord] = []
         pairs: list[tuple[str, int]] = []
@@ -221,7 +230,11 @@ def data_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
                     machiaza_id=machiaza.machiaza_id,
                     name=name,
                     rsdt_addr_flg=machiaza.rsdt_addr_flg,
-                    point=Point(lat=machiaza.lat, lon=machiaza.lon),
+                    point=(
+                        None
+                        if machiaza.lat is None or machiaza.lon is None
+                        else Point(lat=machiaza.lat, lon=machiaza.lon)
+                    ),
                     alt_machiaza=machiaza.alt_machiaza,
                 )
             )

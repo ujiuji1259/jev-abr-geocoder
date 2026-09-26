@@ -327,3 +327,43 @@ async def test_split_parcels_across_folded_machiaza_are_both_reachable(
     # 120 番地は畳んだ側 (machiaza_id=2500) にしか無い。
     assert far.granularity is Granularity.PARCEL
     assert far.lat is not None and round(far.lat, 5) == 33.21120
+
+
+async def test_point_granularity_says_what_the_coordinate_is(data_dir: Path) -> None:
+    """座標が何の代表点かを出力に残す。
+
+    ABR は町字の代表点をすべて持っておらず（全国 442,178 件が欠損、96% は小字
+    レベル）、無いときは市区町村の点で代用する。``granularity`` は町字のままなので、
+    **これが無いと呼び出し側から代用を見分けられない**。郵便番号データ 3,000 件の
+    実測では 5.3% がこの状態だった。
+    """
+    with _geocoder(data_dir, None) as geocoder:
+        town = await geocoder.geocode("鳥取県鳥取市面影一丁目")
+        borrowed = await geocoder.geocode("鳥取県鳥取市青谷町字杉下")
+        numbered = await geocoder.geocode("鳥取県鳥取市面影一丁目1番2号")
+        pref_only = await geocoder.geocode("鳥取県")
+
+    # 町字の代表点がある場合。
+    assert town.granularity is Granularity.MACHIAZA
+    assert town.point_granularity is Granularity.MACHIAZA
+    assert not town.point_is_coarser
+
+    # 無い場合は市区町村の点で代用し、そう言う。
+    assert borrowed.granularity is Granularity.MACHIAZA
+    assert borrowed.point_granularity is Granularity.CITY
+    assert borrowed.point_is_coarser
+
+    # 番号に座標があればそれが一番細かい。
+    assert numbered.granularity is Granularity.RSDT
+    assert numbered.point_granularity is Granularity.RSDT
+    assert not numbered.point_is_coarser
+
+    # 都道府県で止まったときは都道府県の点。粗いのではなく、これが答えの粒度。
+    assert pref_only.point_granularity is Granularity.PREF
+    assert not pref_only.point_is_coarser
+
+
+async def test_point_granularity_is_in_the_output(data_dir: Path) -> None:
+    with _geocoder(data_dir, None) as geocoder:
+        result = await geocoder.geocode("鳥取県鳥取市青谷町字杉下")
+    assert result.to_dict()["point_granularity"] == "city"

@@ -29,7 +29,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
-from .address import Banchi, BanchiKind, CityRecord, Granularity, MachiazaRecord
+from .address import Banchi, BanchiKind, CityRecord, Granularity, MachiazaRecord, Point
 from .config import GeocoderConfig
 from .decision import Decision
 from .index.machiaza_index import MachiazaIndex
@@ -114,6 +114,8 @@ def _at_machiaza(
     name = machiaza.name
     city = index.city(machiaza.lg_code)
     decision = item.machiaza_decision
+    # ABR に町字の代表点が無ければ市区町村の点で代用する。何の点かは出力に残す。
+    point = machiaza.point or (city.point if city else None)
     return replace(
         result,
         pref=name.pref,
@@ -123,7 +125,8 @@ def _at_machiaza(
         machiaza=name.machiaza,
         lg_code=machiaza.lg_code_str,
         machiaza_id=machiaza.machiaza_code,
-        point=machiaza.point or (city.point if city else None),
+        point=point,
+        point_granularity=_source_of(point, machiaza.point, Granularity.MACHIAZA),
         granularity=Granularity.MACHIAZA,
         resolved=True,
         confidence=decision.confidence if decision else 0.0,
@@ -137,6 +140,7 @@ def _at_city(
 ) -> GeocodeResult:
     """町字までは絞れたが確信が持てない。市区町村として返す。"""
     name = machiaza.name
+    point = city.point if city else machiaza.point
     return replace(
         result,
         pref=name.pref,
@@ -144,7 +148,11 @@ def _at_city(
         city=name.city,
         ward=name.ward,
         lg_code=machiaza.lg_code_str,
-        point=city.point if city else machiaza.point,
+        point=point,
+        # 市区町村の点が無ければ町字の点を使う。粒度は答えより細かくなる。
+        point_granularity=_source_of(
+            point, city.point if city else None, Granularity.CITY, Granularity.MACHIAZA
+        ),
         granularity=Granularity.CITY,
         resolved=False,
     )
@@ -165,13 +173,16 @@ def _with_banchi(result: GeocodeResult, item: Resolution, cfg: GeocoderConfig) -
         return _noted(result, _low_confidence_note("番号", decision, entry.display))
 
     numbers = item.tail.numbers if (item.banchi_parent and item.tail) else entry.numbers
+    granularity = _granularity_for(options.kind, numbers)
     result = replace(
         result,
         banchi=_format_banchi(options.kind, numbers),
-        granularity=_granularity_for(options.kind, numbers),
+        granularity=granularity,
         confidence=decision.confidence,
         probability=decision.probability,
         point=entry.point or result.point,
+        # 番号に座標があればそれが一番細かい。無ければ町字の点のまま。
+        point_granularity=granularity if entry.point else result.point_granularity,
         remainder=_remainder_after_banchi(item.tail.raw if item.tail else "", entry),
     )
 
@@ -205,6 +216,7 @@ def _coarse(result: GeocodeResult, item: Resolution, index: MachiazaIndex) -> Ge
                     ward=city.ward,
                     lg_code=f"{city.lg_code:06d}",
                     point=city.point,
+                    point_granularity=_source_of(city.point, city.point, Granularity.CITY),
                     granularity=Granularity.CITY,
                 ),
                 item,
@@ -222,6 +234,7 @@ def _coarse(result: GeocodeResult, item: Resolution, index: MachiazaIndex) -> Ge
                     pref=pref.pref,
                     lg_code=f"{pref.lg_code:06d}",
                     point=pref.point,
+                    point_granularity=_source_of(pref.point, pref.point, Granularity.PREF),
                     granularity=Granularity.PREF,
                 ),
                 item,
@@ -242,6 +255,22 @@ def _ends_here(
 
 
 # -------------------------------------------------------------------- 表記
+
+
+def _source_of(
+    point: Point | None,
+    own: Point | None,
+    granularity: Granularity,
+    fallback: Granularity = Granularity.CITY,
+) -> Granularity:
+    """``point`` が何の代表点かを返す。
+
+    ``own`` はその粒度自身が持っていた点。``point`` がそれと同じなら
+    ``granularity``、代用に落ちていれば ``fallback``、座標が無ければ UNKNOWN。
+    """
+    if point is None:
+        return Granularity.UNKNOWN
+    return granularity if own is not None else fallback
 
 
 def _noted(result: GeocodeResult, note: str) -> GeocodeResult:

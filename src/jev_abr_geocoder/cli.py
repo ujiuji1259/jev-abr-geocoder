@@ -173,7 +173,12 @@ def _human(result: GeocodeResult) -> str:
     head = result.address or "(解決できず)"
     bits = [f"{result.query}  ->  {head}", f"  粒度      : {result.granularity.label}"]
     if result.lat is not None and result.lon is not None:
-        bits.append(f"  座標      : {result.lat:.6f}, {result.lon:.6f}")
+        source = (
+            f"  ({result.point_granularity.label}の代表点で代用)"
+            if result.point_is_coarser
+            else ""
+        )
+        bits.append(f"  座標      : {result.lat:.6f}, {result.lon:.6f}{source}")
     codes = [
         ("lg_code", result.lg_code),
         ("machiaza_id", result.machiaza_id),
