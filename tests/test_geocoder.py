@@ -305,3 +305,25 @@ async def test_batch_statistics_are_merged(data_dir: Path, model: FakeModel) -> 
     assert len(outcome.results) == 6
     assert outcome.town_fast_path == 6
     assert outcome.number_fast_path == 6
+
+
+async def test_split_parcels_across_folded_machiaza_are_both_reachable(
+    data_dir: Path,
+) -> None:
+    """ABR が同じ場所を 2 レコードに分けたとき、地番も両方から引ける。
+
+    「字青野」と「青野」のように大字・字の有無だけが違う 2 レコードは同じ
+    住所だが、**地番はどちらか一方にしか無い**ことも、**両方に割れている**
+    ことも実測されている（栗原市築館新田は字あり 324 筆 / 字なし 10 筆）。
+    畳んだ側の machiaza_id も引かないと取りこぼす。
+    """
+    with Geocoder.open(data_dir, model=None) as geocoder:
+        near = await geocoder.geocode("長崎県北松浦郡佐々町字小浦免7番地")
+        far = await geocoder.geocode("長崎県北松浦郡佐々町字小浦免120番地")
+
+    assert near.level is Level.PARCEL
+    assert near.lat is not None and round(near.lat, 5) == 33.21005
+
+    # 120 番地は畳んだ側 (machiaza_id=2500) にしか無い。
+    assert far.level is Level.PARCEL
+    assert far.lat is not None and round(far.lat, 5) == 33.21120

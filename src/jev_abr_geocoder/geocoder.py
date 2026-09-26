@@ -357,26 +357,47 @@ class Geocoder:
                 continue
             if not self._town_is_confident(item):
                 continue
-            kind = town.number_kind
-            entries = self._index.store.fetch_numbers(
-                town.lg_code, town.machiaza_id, kind, num1=tail.first
-            )
-            if kind is NumberKind.RSDT and not _has_exact(entries, tail.numbers):
-                # 住居表示実施区域でも街区までしか無い町字、住居表示と地番の
-                # 両方を持つ町字（全国 1,248 件）、そして「街区だけ入力されて
-                # 住居番号が無い」場合があるので順に落とす。
-                for fallback in (NumberKind.BLOCK, NumberKind.PARCEL):
-                    alternative = self._index.store.fetch_numbers(
-                        town.lg_code, town.machiaza_id, fallback, num1=tail.first
-                    )
-                    if _has_exact(alternative, tail.numbers):
-                        entries, kind = alternative, fallback
-                        break
-                    entries = entries or alternative
-                    if entries is alternative and alternative:
-                        kind = fallback
+            entries, kind = self._fetch_numbers(town, tail)
             item.entries = entries
             item.kind = kind
+
+    def _fetch_numbers(self, town: TownRecord, tail: Tail) -> tuple[list[NumberEntry], NumberKind]:
+        """町字にぶら下がる番号を引く。
+
+        ABR が同じ場所を「字青野」「青野」の 2 レコードに分けている場合、
+        **地番も 2 つに割れている**（栗原市築館新田は字あり側 324 筆、字なし側
+        に別の 10 筆）。:attr:`TownRecord.machiaza_ids` を順に引き、入力に
+        ぴったり合うものが出たところで止める。
+        """
+        kind = town.number_kind
+        best: list[NumberEntry] = []
+        best_kind = kind
+        for machiaza_id in town.machiaza_ids:
+            found, found_kind = self._fetch_one(town.lg_code, machiaza_id, kind, tail)
+            if _has_exact(found, tail.numbers):
+                return found, found_kind
+            if found and not best:
+                best, best_kind = found, found_kind
+        return best, best_kind
+
+    def _fetch_one(
+        self, lg_code: int, machiaza_id: int, kind: NumberKind, tail: Tail
+    ) -> tuple[list[NumberEntry], NumberKind]:
+        entries = self._index.store.fetch_numbers(lg_code, machiaza_id, kind, num1=tail.first)
+        if kind is NumberKind.RSDT and not _has_exact(entries, tail.numbers):
+            # 住居表示実施区域でも街区までしか無い町字、住居表示と地番の
+            # 両方を持つ町字（全国 1,248 件）、そして「街区だけ入力されて
+            # 住居番号が無い」場合があるので順に落とす。
+            for fallback in (NumberKind.BLOCK, NumberKind.PARCEL):
+                alternative = self._index.store.fetch_numbers(
+                    lg_code, machiaza_id, fallback, num1=tail.first
+                )
+                if _has_exact(alternative, tail.numbers):
+                    return alternative, fallback
+                entries = entries or alternative
+                if entries is alternative and alternative:
+                    kind = fallback
+        return entries, kind
 
     async def _resolve_numbers(self, items: Sequence[_Item], outcome: BatchOutcome) -> None:
         asks: list[NumberAsk] = []

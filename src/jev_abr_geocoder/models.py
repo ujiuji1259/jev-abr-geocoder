@@ -119,6 +119,17 @@ class TownRecord:
     #: この行の出所。``"abr"`` か ``"geolonia"``。
     #: geolonia の行は ABR に無い町字を補うもので、machiaza_id を持たない。
     source: str = "abr"
+    #: 同じ場所が別の machiaza_id でも収録されている場合の、残りの machiaza_id。
+    #:
+    #: ABR は同じ町字を「字青野」と「青野」の 2 レコードに分けて持つことが
+    #: あり（全国 3,816 組）、**地番が両方に分かれている**。栗原市築館新田は
+    #: 字あり側に 324 筆、字なし側に別の 10 筆。片方しか引かないと取りこぼす。
+    alt_machiaza: tuple[int, ...] = ()
+
+    @property
+    def machiaza_ids(self) -> tuple[int, ...]:
+        """層2 を引くべき machiaza_id。代表が先頭。"""
+        return (self.machiaza_id, *self.alt_machiaza)
 
     @property
     def town(self) -> str:

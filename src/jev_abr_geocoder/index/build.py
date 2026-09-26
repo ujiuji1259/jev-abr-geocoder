@@ -63,6 +63,8 @@ class _TownRow:
     lat_1e7: int | None
     lon_1e7: int | None
     source: str = "abr"
+    #: 同じ場所の別レコードの machiaza_id。
+    alt_machiaza: list[int] = field(default_factory=list)
     #: ABR の ``chome_number`` 列。丁目の漢数字・算用数字の別名を作るのに要る。
     #: ``machiaza_id`` の下 3 桁からは復元できない（丁目でない枝番も同じ桁を
     #: 使うため、全国 727,429 行のうち 526,344 行でずれる）。
@@ -85,6 +87,7 @@ class _TownRow:
             self.lat_1e7,
             self.lon_1e7,
             self.source,
+            ",".join(str(x) for x in self.alt_machiaza),
         )
 
 
@@ -100,6 +103,8 @@ class BuildReport:
     geolonia_towns: int = 0
     #: ABR に既にあったので行を足さず別名だけ足した Geolonia の町字。
     geolonia_merged: int = 0
+    #: 大字・字の違いだけの別レコードとしてまとめた ABR の町字。
+    towns_folded: int = 0
     trie_keys: int = 0
     numbers: int = 0
     elapsed: float = 0.0
@@ -225,10 +230,11 @@ def _build_towns(
     text: Sequence[Path],
     pos: Sequence[Path],
     geolonia_csv: Path | None = None,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     """``town`` テーブルと ``town.marisa`` を作る。
 
-    ``(町字数, 鍵数, geolonia から補った数, geolonia を畳んだ数)`` を返す。
+    ``(町字数, 鍵数, geolonia から補った数, geolonia を畳んだ数,
+    ABR 内で畳んだ数)`` を返す。
     """
     positions = _load_town_positions(pos)
     rows: list[_TownRow] = []
@@ -239,6 +245,20 @@ def _build_towns(
     # まったく同じ選択肢を Jev に 2 つ見せる**ことになり、答えようがないので
     # 確信度が割れて粒度が落ちる。同じ町字なので 1 行にまとめる。
     by_machiaza: dict[tuple[int, int], int] = {}
+    # 大字・字を落とした名前 -> town_id。
+    # ABR は同じ町字を「字青野」と「青野」の 2 レコードに分けて持つことが
+    # ある（全国 3,816 組）。「字」は小字であることを示す構造の印で名前の
+    # 一部ではないので、**これは同じ住所**。栗原市築館青野で確認したところ、
+    # 両側の地番は空間的に隣接していて番号帯だけが 1..11 と 42..101 に
+    # 割れていた。鳥取県の 88 組では片側の地番が 0 件（幽霊）。
+    #
+    # 分けたままだと (1) 見分けのつかない選択肢を Jev に見せる (2) 選んだ
+    # 側にしか地番が無いと取りこぼす。1 行にまとめ、**両方の machiaza_id を
+    # 持たせて層2 は両方引く**。
+    by_place: dict[tuple[int, str, str, str], int] = {}
+    #: まとめ先が既に持っている鍵。同じ (鍵, 町字) を二重に登録しないため。
+    grown: dict[int, set[str]] = {}
+    folded = 0
 
     for path in text:
         for row in csvsrc.read_rows(path):
@@ -279,8 +299,31 @@ def _build_towns(
                     merged.lat_1e7, merged.lon_1e7 = lat, lon
                 continue
 
+            place = (
+                lg_code,
+                _TOWN_PREFIX.sub("", name.oaza_cho),
+                name.chome,
+                _TOWN_PREFIX.sub("", name.koaza),
+            )
+            twin = by_place.get(place)
+            if twin is not None:
+                # 同じ場所の別レコード。行は足さず、machiaza_id と別名を足す。
+                kept = rows[twin]
+                kept.alt_machiaza.append(machiaza_id)
+                kept.rsdt_addr_flg = max(kept.rsdt_addr_flg, flg)
+                if kept.lat_1e7 is None:
+                    kept.lat_1e7, kept.lon_1e7 = lat, lon
+                by_machiaza[slot] = twin
+                already = grown.setdefault(twin, town_aliases(_name_of(kept)))
+                payload = (twin,)
+                pairs.extend((alias, payload) for alias in aliases - already)
+                already |= aliases
+                folded += 1
+                continue
+
             town_id = len(rows)
             by_machiaza[slot] = town_id
+            by_place[place] = town_id
             rows.append(
                 _TownRow(
                     town_id=town_id,
@@ -311,7 +354,7 @@ def _build_towns(
     tmp = data_dir / f"{TRIE_FILENAME}.tmp"
     trie.save(str(tmp))
     tmp.replace(data_dir / TRIE_FILENAME)
-    return len(rows), len(pairs), added, merged
+    return len(rows), len(pairs), added, merged, folded
 
 
 def _add_geolonia_towns(
@@ -663,6 +706,7 @@ async def build(
                 report.trie_keys,
                 report.geolonia_towns,
                 report.geolonia_merged,
+                report.towns_folded,
             ) = _build_towns(
                 store,
                 data_dir,

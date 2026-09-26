@@ -32,6 +32,8 @@ class _Town:
     rsdt_addr_flg: int
     lat: float
     lon: float
+    #: 同じ場所の別レコードの machiaza_id。カンマ区切り。
+    alt_machiaza: str = ""
 
 
 #: 実データを模した最小構成。それぞれ試したい性質のために置いてある。
@@ -115,6 +117,25 @@ _TOWNS = [
         33.2535,
         129.6629,
     ),
+    # ABR が同じ場所を「字○○」と「○○」の 2 レコードに分けて持ち、地番も
+    # 両方に割れている型（栗原市築館新田で実測）。代表 1 行に畳み、
+    # alt_machiaza にもう一方の machiaza_id を持たせる。
+    _Town(
+        423912,
+        2000,
+        "長崎県",
+        "北松浦郡",
+        "佐々町",
+        "",
+        "字小浦免",
+        "",
+        "",
+        "",
+        0,
+        33.2100,
+        129.6500,
+        alt_machiaza="2500",
+    ),
 ]
 
 _CITIES = [
@@ -146,7 +167,10 @@ _PARCEL = {
         NumberEntry(1, 1, 0, Point(33.25355, 129.66294)),
         NumberEntry(1, 2, 0, Point(33.25322, 129.66262)),
         NumberEntry(2, 1, 0, Point(33.25324, 129.66316)),
-    ]
+    ],
+    # 字小浦免。代表の machiaza_id に 7 番地、畳んだ側に 120 番地。
+    (423912, 2000): [NumberEntry(7, 0, 0, Point(33.21005, 129.65004))],
+    (423912, 2500): [NumberEntry(120, 0, 0, Point(33.21120, 129.65110))],
 }
 
 
@@ -183,6 +207,7 @@ def data_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
                     round(town.lat * _SCALE),
                     round(town.lon * _SCALE),
                     "abr",
+                    town.alt_machiaza,
                 )
             )
             name = TownName(

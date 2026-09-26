@@ -18,7 +18,7 @@ from . import numblob
 
 __all__ = ["Store", "SCHEMA_VERSION", "DB_FILENAME"]
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DB_FILENAME = "abr.db"
 
 _SCHEMA = """
@@ -71,7 +71,11 @@ CREATE TABLE IF NOT EXISTS town(
     lon_1e7       INTEGER,
     -- 'abr' か 'geolonia'。geolonia の行は ABR に無い町字を補うもので、
     -- machiaza_id を持たないため層2（街区・住居番号・地番）は引けない。
-    source        TEXT NOT NULL DEFAULT 'abr'
+    source        TEXT NOT NULL DEFAULT 'abr',
+    -- 同じ場所が別 machiaza_id でも収録されている場合の、残りの machiaza_id。
+    -- カンマ区切り。ABR は同じ町字を「字青野」「青野」の 2 レコードに分けて
+    -- 持つことがあり、地番が両方に分かれている。層2 はここも引く。
+    alt_machiaza  TEXT NOT NULL DEFAULT ''
 );
 -- 同じ町字を 2 行に分けない。mt_town は住居表示と地番の両方を持つ町字を
 -- rsdt_addr_flg 違いの 2 行で収録しているが、取り込み時に 1 行へまとめる。
@@ -214,7 +218,7 @@ class Store:
     def replace_towns(self, rows: Iterable[Sequence[Any]]) -> None:
         self._conn.execute("DELETE FROM town")
         self._conn.executemany(
-            "INSERT INTO town VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
+            "INSERT INTO town VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
         )
 
     def put_numbers(
@@ -341,7 +345,13 @@ def _town_record(row: sqlite3.Row) -> TownRecord:
         rsdt_addr_flg=int(row["rsdt_addr_flg"]),
         point=_point(row["lat_1e7"], row["lon_1e7"]),
         source=str(row["source"]),
+        alt_machiaza=_alt(row["alt_machiaza"]),
     )
+
+
+def _alt(value: object) -> tuple[int, ...]:
+    text = str(value or "")
+    return tuple(int(x) for x in text.split(",")) if text else ()
 
 
 def _chunks(items: list[int], size: int) -> Iterator[list[int]]:
