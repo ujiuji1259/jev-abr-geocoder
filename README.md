@@ -30,6 +30,21 @@ with Geocoder.open(Path("data")) as geocoder:
 `geocode_many` は何件でも受け取り、`batch_size` ごとに区切って並行に処理する。
 1 バッチあたりの Jev 往復は高々 2 回（候補が多すぎる市区町村だけ 3 回）。
 
+外部依存 — Jev (typesafe-sdk)、トライ (marisa-trie)、永続化 (sqlite3)、HTTP (httpx) —
+はすべて `ports.py` の Protocol の後ろにあり、それらを import しているのは
+`adapters/` の中だけ。差し替えるならポートを満たすものを渡す。
+
+```python
+from jev_abr_geocoder import Geocoder, GeocoderConfig, adapters
+
+
+class MyModel:  # ports.DecisionModel を満たすだけでよい
+    async def choose(self, questions): ...
+
+
+geocoder = Geocoder(adapters.open_index(Path("data")), MyModel(), GeocoderConfig())
+```
+
 **処理時間の大半は Jev の応答待ちで、こちらの計算ではない。** 鳥取県の法人
 20,235 件では待ちが 103.6 秒に対しローカル処理は 15.0 秒だった。並行化が
 そのまま実効速度になる。
@@ -107,7 +122,7 @@ Geolonia 住所データは ABR・国土数値情報の位置参照情報・郵�
 | | |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | データ構成と容量・性能の実測に基づく設計判断 |
-| [docs/code-design.md](docs/code-design.md) | モジュール分割・型・インターフェース |
+| [docs/code-design.md](docs/code-design.md) | モジュール分割・ポートとアダプタ・型 |
 | [docs/eval.md](docs/eval.md) | 評価セットと指標、閾値の決め方 |
 
 ## 状態

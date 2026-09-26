@@ -1,20 +1,32 @@
-"""テスト用の小さな索引と、差し替え可能な判定モデル。"""
+"""テスト用の小さな索引と、差し替え可能な判定モデル。
+
+索引は既定のアダプタ（SQLite + marisa-trie）で本物を組む。判定モデルだけは
+:class:`ports.DecisionModel` を満たす :class:`FakeModel` を差し込む。Jev の
+Choice の作り方も応答の形も知らなくてよいのが、ポートを切ってある効き目。
+"""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import pytest
 
-from jev_abr_geocoder.index.keys import TownName, town_aliases
-from jev_abr_geocoder.index.store import DB_FILENAME, Store
-from jev_abr_geocoder.index.townindex import TRIE_FILENAME, TownIndex, build_trie
-from jev_abr_geocoder.models import NumberEntry, NumberKind, Point
-
-_SCALE = 10_000_000
+from jev_abr_geocoder import adapters, ports
+from jev_abr_geocoder.index.keys import town_aliases
+from jev_abr_geocoder.index.townindex import TownIndex
+from jev_abr_geocoder.models import (
+    CityRecord,
+    Decision,
+    NumberEntry,
+    NumberKind,
+    Point,
+    PrefRecord,
+    TownName,
+    TownRecord,
+    Usage,
+)
 
 
 @dataclass(frozen=True)
@@ -32,8 +44,8 @@ class _Town:
     rsdt_addr_flg: int
     lat: float
     lon: float
-    #: 同じ場所の別レコードの machiaza_id。カンマ区切り。
-    alt_machiaza: str = ""
+    #: 同じ場所の別レコードの machiaza_id。
+    alt_machiaza: tuple[int, ...] = ()
 
 
 #: 実データを模した最小構成。それぞれ試したい性質のために置いてある。
@@ -134,15 +146,15 @@ _TOWNS = [
         0,
         33.2100,
         129.6500,
-        alt_machiaza="2500",
+        alt_machiaza=(2500,),
     ),
 ]
 
 _CITIES = [
-    (0, 312011, "鳥取県", "", "鳥取市", ""),
-    (1, 423912, "長崎県", "北松浦郡", "佐々町", ""),
-    (2, 131105, "東京都", "", "目黒区", ""),
-    (3, 261041, "京都府", "", "京都市", "中京区"),
+    (312011, "鳥取県", "", "鳥取市", ""),
+    (423912, "長崎県", "北松浦郡", "佐々町", ""),
+    (131105, "東京都", "", "目黒区", ""),
+    (261041, "京都府", "", "京都市", "中京区"),
 ]
 
 _PREFS = [
@@ -178,36 +190,34 @@ _PARCEL = {
 def data_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """小さな索引を 1 度だけ組み立てる。"""
     path = tmp_path_factory.mktemp("index")
-    with Store.create(path / DB_FILENAME) as store:
+    store = adapters.create_writer(path)
+    try:
         store.replace_prefs(
-            [(lg, name, round(lat * _SCALE), round(lon * _SCALE)) for lg, name, lat, lon in _PREFS]
+            PrefRecord(lg_code=lg, pref=name, point=Point(lat=lat, lon=lon))
+            for lg, name, lat, lon in _PREFS
         )
         store.replace_cities(
-            [
-                (cid, lg, pref, county, city, ward, None, None)
-                for cid, lg, pref, county, city, ward in _CITIES
-            ]
+            CityRecord(lg_code=lg, pref=pref, county=county, city=city, ward=ward)
+            for lg, pref, county, city, ward in _CITIES
         )
-        rows: list[tuple[Any, ...]] = []
-        pairs: list[tuple[str, tuple[int]]] = []
+        records: list[TownRecord] = []
+        pairs: list[tuple[str, int]] = []
         for town_id, town in enumerate(_TOWNS):
-            rows.append(
-                (
-                    town_id,
-                    town.lg_code,
-                    town.machiaza_id,
-                    town.pref,
-                    town.county,
-                    town.city,
-                    town.ward,
-                    town.oaza_cho,
-                    town.chome,
-                    town.koaza,
-                    town.rsdt_addr_flg,
-                    round(town.lat * _SCALE),
-                    round(town.lon * _SCALE),
-                    "abr",
-                    town.alt_machiaza,
+            records.append(
+                TownRecord(
+                    town_id=town_id,
+                    lg_code=town.lg_code,
+                    machiaza_id=town.machiaza_id,
+                    pref=town.pref,
+                    county=town.county,
+                    city=town.city,
+                    ward=town.ward,
+                    oaza_cho=town.oaza_cho,
+                    chome=town.chome,
+                    koaza=town.koaza,
+                    rsdt_addr_flg=town.rsdt_addr_flg,
+                    point=Point(lat=town.lat, lon=town.lon),
+                    alt_machiaza=town.alt_machiaza,
                 )
             )
             name = TownName(
@@ -220,65 +230,78 @@ def data_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
                 town.chome_number,
                 town.koaza,
             )
-            pairs.extend((alias, (town_id,)) for alias in town_aliases(name))
-        store.replace_towns(rows)
-        for (lg, machiaza), entries in _RSDT.items():
-            store.put_numbers(lg, machiaza, NumberKind.RSDT, entries)
-        for (lg, machiaza), entries in _PARCEL.items():
-            store.put_numbers(lg, machiaza, NumberKind.PARCEL, entries)
-        store.set_meta("schema_version", "1")
+            pairs.extend((alias, town_id) for alias in town_aliases(name))
+        store.replace_towns(records)
+        store.put_numbers_many(
+            [(lg, machiaza, NumberKind.RSDT, entries) for (lg, machiaza), entries in _RSDT.items()]
+            + [
+                (lg, machiaza, NumberKind.PARCEL, entries)
+                for (lg, machiaza), entries in _PARCEL.items()
+            ]
+        )
         store.commit()
+    finally:
+        store.close()
 
-    build_trie(pairs).save(str(path / TRIE_FILENAME))
+    adapters.tries().save(pairs, adapters.trie_path(path))
     return path
 
 
 @pytest.fixture
 def index(data_dir: Path) -> TownIndex:
-    return TownIndex.open(data_dir)
+    return adapters.open_index(data_dir)
 
 
 @dataclass
 class FakeModel:
-    """Jev の差し替え。
+    """判定モデルの差し替え。:class:`ports.DecisionModel` を満たす。
 
-    ``picks`` は質問 ID からオプション ID への写像。与えられなかった質問は
-    先頭のオプションを選ぶ。``calls`` に渡されたリクエストを積むので、
-    **バッチ全体で 1 回しか呼ばれていないこと**をテストで検証できる。
+    ``picks`` は問の添字から選ぶ選択肢の添字への写像。``None`` を与えると
+    「候補のいずれでもない」を選ぶ。与えられなかった問は先頭を選ぶ。
+    ``calls`` に渡された問を積むので、**バッチ全体で 1 回しか呼ばれていない
+    こと**をテストで検証できる。
     """
 
-    picks: dict[str, str] = field(default_factory=dict)
+    picks: dict[int, int | None] = field(default_factory=dict)
     confidence: float = 0.95
-    calls: list[tuple[Any, Mapping[str, Any]]] = field(default_factory=list)
+    calls: list[Sequence[ports.Question]] = field(default_factory=list)
     fail: bool = False
 
-    async def ask(
-        self, state: Any, questions: Mapping[str, Any]
-    ) -> tuple[Mapping[str, Any], tuple[int, int]]:
-        self.calls.append((state, questions))
+    async def choose(self, questions: Sequence[ports.Question]) -> ports.ChoiceSet:
+        self.calls.append(list(questions))
         if self.fail:
-            raise RuntimeError("模擬障害")
-        answers: dict[str, Any] = {}
-        for key, question in questions.items():
-            options: Sequence[str] = list(question.criteria.keys())
-            chosen = self.picks.get(key, options[0])
-            answers[key] = _FakeChoice(chosen, options, self.confidence)
-        return answers, (100, 10)
+            raise ports.ModelUnavailable("模擬障害")
+        usage = Usage()
+        usage.add(100, 10)
+        return ports.ChoiceSet(
+            decisions=[self._decide(i, q) for i, q in enumerate(questions)], usage=usage
+        )
+
+    def _decide(self, index: int, question: ports.Question) -> Decision:
+        """「候補のいずれでもない」を含む確率分布を模す。
+
+        選んだものに ``confidence``、残りに均等。実装が閾値の扱いを変えたら
+        落ちるよう、確率の出方まで本物に合わせておく。
+        """
+        rest = (1.0 - self.confidence) / max(1, len(question.options))
+        chosen = self.picks.get(index, 0)
+        if chosen is None:
+            return Decision(
+                index=None,
+                probability=self.confidence,
+                confidence=self.confidence,
+                contains_answer=1.0 - self.confidence,
+            )
+        return Decision(
+            index=chosen,
+            probability=self.confidence,
+            confidence=self.confidence,
+            contains_answer=1.0 - rest,
+        )
 
     @property
     def request_count(self) -> int:
         return len(self.calls)
-
-
-class _FakeChoice:
-    type = "choice"
-
-    def __init__(self, choice: str, options: Sequence[str], confidence: float) -> None:
-        self.choice = choice
-        self.confidence = confidence
-        rest = (1.0 - confidence) / max(1, len(options) - 1)
-        self.probabilities = {option: rest for option in options}
-        self.probabilities[choice] = confidence
 
 
 @pytest.fixture

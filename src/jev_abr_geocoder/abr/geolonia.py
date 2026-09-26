@@ -27,7 +27,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
+from .. import ports
 
 __all__ = ["GeoloniaTown", "DATA_URL", "ATTRIBUTION", "LICENSE", "download", "read_rows"]
 
@@ -43,10 +43,6 @@ ATTRIBUTION = (
 
 _FILENAME = "geolonia-latest.csv"
 
-# 「大字町丁目名」に含まれる丁目。ABR は大字と丁目を別列に持つので、
-# 突き合わせのときだけ切り離す。
-_CHOME_SUFFIX = ("丁目", "丁")
-
 
 @dataclass(frozen=True, slots=True)
 class GeoloniaTown:
@@ -59,30 +55,17 @@ class GeoloniaTown:
     lat: float | None
     lon: float | None
 
-    @property
-    def has_chome(self) -> bool:
-        return self.town.endswith(_CHOME_SUFFIX)
 
-    @property
-    def full(self) -> str:
-        return f"{self.pref}{self.city}{self.town}{self.koaza}"
-
-
-def download(cache_dir: Path, *, client: httpx.Client | None = None) -> Path:
+async def download(cache_dir: Path, client: ports.HttpClient) -> Path:
     """CSV を取得してキャッシュする。約 52 MB。"""
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_dir / _FILENAME
-    owns = client is None
-    http = client or httpx.Client(follow_redirects=True, timeout=300.0)
-    try:
-        response = http.get(DATA_URL)
-        response.raise_for_status()
-        tmp = path.with_suffix(path.suffix + ".part")
-        tmp.write_bytes(response.content)
-        tmp.replace(path)
-    finally:
-        if owns:
-            http.close()
+    response = await client.get(DATA_URL, timeout=300.0)
+    response.raise_for_status()
+    # 壊れた途中結果を残さないよう、一時ファイルに書いてから差し替える。
+    tmp = path.with_suffix(path.suffix + ".part")
+    tmp.write_bytes(response.content)
+    tmp.replace(path)
     return path
 
 

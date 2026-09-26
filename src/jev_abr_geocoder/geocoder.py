@@ -6,38 +6,32 @@
 そのため :meth:`Geocoder.geocode` は :meth:`geocode_many` に委譲するだけで、
 単数形の専用経路を持たない。単数経路があると「1 件ずつループで呼ぶ」が自然に
 書けてしまい、10 倍遅く 12 倍高くなる（docs/code-design.md 制約1）。
+
+ここにあるのは**段取りだけ**。何を訊くかは :mod:`match.rerank`、番号の引き方は
+:mod:`match.numbers`、結果の組み立てと閾値ゲートは :mod:`assemble` にある。
 """
 
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Generic, TypeVar
 
-from . import textnorm
+from . import assemble, ports, textnorm
+from .assemble import Resolution
 from .config import GeocoderConfig
 from .index.townindex import TownIndex
-from .match.candidates import CandidateFinder, CandidateSet
-from .match.rerank import BeamAsk, DecisionModel, JevModel, NumberAsk, Reranker, TownAsk
-from .match.tail import Tail, parse_tail
-from .models import (
-    BatchOutcome,
-    CityRecord,
-    Decision,
-    GeocodeResult,
-    Level,
-    NumberEntry,
-    NumberKind,
-    TownCandidate,
-    TownRecord,
-    Usage,
-)
+from .match import numbers
+from .match.candidates import CandidateFinder, group_by_display, group_by_oaza
+from .match.rerank import BeamAsk, NumberAsk, Reranker, TownAsk
+from .match.tail import parse_tail
+from .models import BatchOutcome, Decision, GeocodeResult, TownCandidate, TownRecord
 
 __all__ = ["Geocoder", "AUTO_MODEL"]
 
-_DIGITS = re.compile(r"\d+")
+_Ask = TypeVar("_Ask")
 
 
 class _AutoModel:
@@ -55,25 +49,23 @@ AUTO_MODEL = _AutoModel()
 
 
 @dataclass(slots=True)
-class _Item:
-    """1 件分の途中状態。"""
+class _Pending(Generic[_Ask]):
+    """判定モデルに投げる 1 問と、その答えを書き戻す先。
 
-    query: str
-    normalized: str
-    candidates: CandidateSet
-    result: GeocodeResult
-    town: TownRecord | None = None
-    town_decision: Decision | None = None
-    tail: Tail | None = None
-    entries: list[NumberEntry] = field(default_factory=list)
-    number_decision: Decision | None = None
-    kind: NumberKind | None = None
-    #: 入力が親番までで、枝番は ABR にしか無い場合 True。
-    number_parent: bool = False
+    問と宛先を別々の平行リストで持つと、片方にだけ足す退行が静かに起きる。
+    1 つの型にまとめて添字の対応づけを消す。
+    """
+
+    ask: _Ask
+    item: Resolution
+    #: 町字の段では選択肢ごとにまとめた候補。番号の段では使わない。
+    groups: list[list[TownCandidate]] = field(default_factory=list)
 
 
 class Geocoder:
-    def __init__(self, index: TownIndex, model: DecisionModel | None, cfg: GeocoderConfig) -> None:
+    def __init__(
+        self, index: TownIndex, model: ports.DecisionModel | None, cfg: GeocoderConfig
+    ) -> None:
         self._index = index
         self._cfg = cfg
         self._finder = CandidateFinder(index, cfg)
@@ -85,17 +77,19 @@ class Geocoder:
         cls,
         data_dir: Path,
         *,
-        model: DecisionModel | None | _AutoModel = AUTO_MODEL,
+        model: ports.DecisionModel | None | _AutoModel = AUTO_MODEL,
         cfg: GeocoderConfig | None = None,
     ) -> Geocoder:
-        """索引を開く。
+        """索引を開く。**ここが合成の根**で、既定のアダプタを選ぶ。
 
         ``model`` を省略すると環境変数から Jev クライアントを作る。``None`` を
-        明示すると Jev を使わず、トライの候補だけで判定する。
+        明示すると判定モデルを使わず、トライの候補だけで決める。
         """
+        from . import adapters
+
         config = cfg or GeocoderConfig()
-        index = TownIndex.open(data_dir)
-        resolved = JevModel.from_env(config) if isinstance(model, _AutoModel) else model
+        index = adapters.open_index(data_dir)
+        resolved = adapters.jev_model(config) if isinstance(model, _AutoModel) else model
         return cls(index, resolved, config)
 
     def close(self) -> None:
@@ -153,11 +147,7 @@ class Geocoder:
                 return await self.run(chunk)
 
         for outcome in await asyncio.gather(*(one(chunk) for chunk in chunks)):
-            merged.results.extend(outcome.results)
-            merged.town_fast_path += outcome.town_fast_path
-            merged.number_fast_path += outcome.number_fast_path
-            merged.beam_requests += outcome.beam_requests
-            _merge_usage(merged.usage, outcome.usage)
+            merged.merge(outcome)
         return merged
 
     async def run(self, queries: Sequence[str]) -> BatchOutcome:
@@ -171,36 +161,34 @@ class Geocoder:
             return outcome
 
         items = [self._prepare(query) for query in queries]
-        town_records = self._load_town_records(items)
+        records = self._load_town_records(items)
 
-        await self._narrow(items, town_records, outcome)
-        await self._resolve_towns(items, town_records, outcome)
+        await self._narrow(items, records, outcome)
+        await self._resolve_towns(items, records, outcome)
         self._load_numbers(items)
         await self._resolve_numbers(items, outcome)
 
-        outcome.results = [item.result for item in items]
+        outcome.results = [assemble.build(item, self._index, self._cfg) for item in items]
         return outcome
 
     # --------------------------------------------------------------- 段取り
 
-    def _prepare(self, query: str) -> _Item:
+    def _prepare(self, query: str) -> Resolution:
         normalized = textnorm.normalize(query)
-        candidates = self._finder.find(normalized)
-        return _Item(
+        return Resolution(
             query=query,
             normalized=normalized,
-            candidates=candidates,
-            result=GeocodeResult(query=query, normalized=normalized),
+            candidates=self._finder.find(normalized),
         )
 
-    def _load_town_records(self, items: Sequence[_Item]) -> dict[int, TownRecord]:
+    def _load_town_records(self, items: Sequence[Resolution]) -> dict[int, TownRecord]:
         """バッチ全体の候補について町字レコードをまとめて引く。"""
-        town_ids = {candidate.town_id for item in items for candidate in item.candidates.candidates}
+        town_ids = {c.town_id for item in items for c in item.candidates.candidates}
         return self._index.store.towns(sorted(town_ids))
 
     async def _narrow(
         self,
-        items: Sequence[_Item],
+        items: Sequence[Resolution],
         records: dict[int, TownRecord],
         outcome: BatchOutcome,
     ) -> None:
@@ -215,61 +203,51 @@ class Geocoder:
         **この段があるぶん、その入力だけは往復が 3 回になる。** 走るのは
         全体の 0.3% 程度なので、バッチ全体では 1 リクエスト増えるだけ。
         """
-        asks: list[BeamAsk] = []
-        ask_items: list[_Item] = []
-        ask_groups: list[list[list[TownCandidate]]] = []
-
+        pending: list[_Pending[BeamAsk]] = []
         for item in items:
             if not item.candidates.needs_beam:
                 continue
             candidates = [c for c in item.candidates.candidates if c.town_id in records]
             if not candidates or self._reranker is None:
                 # 判定モデルが無いなら絞りようがない。粒度を落とす。
-                item.candidates = _without_candidates(item.candidates)
+                item.candidates = item.candidates.narrowed([])
                 continue
-            groups = _group_by_oaza(candidates, records)
-            asks.append(
-                BeamAsk(
-                    query=item.query,
-                    normalized=item.normalized,
-                    options=[records[g[0].town_id].oaza_display for g in groups],
+            groups = group_by_oaza(candidates, records)
+            pending.append(
+                _Pending(
+                    ask=BeamAsk(
+                        query=item.query,
+                        normalized=item.normalized,
+                        options=[records[g[0].town_id].oaza_display for g in groups],
+                    ),
+                    item=item,
+                    groups=groups,
                 )
             )
-            ask_items.append(item)
-            ask_groups.append(groups)
 
-        if not asks or self._reranker is None:
+        if not pending or self._reranker is None:
             return
-        result = await self._reranker.narrow(asks)
-        _merge_usage(outcome.usage, result.usage)
+        result = await self._reranker.narrow([p.ask for p in pending])
+        outcome.usage.merge(result.usage)
         outcome.beam_requests += result.usage.requests
-        for index, item in enumerate(ask_items):
-            groups = ask_groups[index]
-            kept = result.survivors[index] if index < len(result.survivors) else []
-            survivors: list[TownCandidate] = []
-            for group_index in kept:
-                if 0 <= group_index < len(groups):
-                    survivors.extend(groups[group_index])
+
+        for p, kept in zip(pending, result.survivors, strict=True):
+            survivors = [c for i in kept if 0 <= i < len(p.groups) for c in p.groups[i]]
             if not survivors:
-                item.result.note = item.result.note or (
+                p.item.remember(
                     _failure_note(result.failure) if result.failure else "候補を絞り込めなかった"
                 )
             # 大字が決まっても丁目・小字が上限を超えることがある（全国 129,584
             # 組のうち 80 組）。次段が API 制限を破らないようここで収める。
-            item.candidates = _with_candidates(
-                item.candidates, survivors[: self._cfg.max_candidates]
-            )
+            p.item.candidates = p.item.candidates.narrowed(survivors[: self._cfg.max_candidates])
 
     async def _resolve_towns(
         self,
-        items: Sequence[_Item],
+        items: Sequence[Resolution],
         records: dict[int, TownRecord],
         outcome: BatchOutcome,
     ) -> None:
-        asks: list[TownAsk] = []
-        ask_items: list[_Item] = []
-        ask_groups: list[list[list[TownCandidate]]] = []
-
+        pending: list[_Pending[TownAsk]] = []
         for item in items:
             candidates = [c for c in item.candidates.candidates if c.town_id in records]
             if not candidates:
@@ -280,136 +258,74 @@ class Geocoder:
                 # 0.9% に落ちる（同長の競合と曖昧一致だけが残る）。
                 unambiguous = item.candidates.unambiguous()
                 if unambiguous is not None and unambiguous.town_id in records:
-                    item.town = records[unambiguous.town_id]
-                    item.tail = parse_tail(unambiguous.remainder)
-                    item.town_decision = Decision(
-                        index=0,
-                        probability=1.0,
-                        confidence=1.0,
-                        contains_answer=1.0,
-                        fast_path=True,
-                    )
+                    _accept(item, records, unambiguous, Decision.fast())
                     outcome.town_fast_path += 1
                     continue
-            # **表示が同じ候補を Jev に重ねて見せない。** 京都市中京区には
-            # 同名の「大文字町」が 4 つあり、そのまま並べると同一文字列の
-            # 選択肢が 4 つ並ぶ。答えようがないので確信度が割れ、住所としては
-            # 正しいのに閾値を下回って粒度が落ちていた。
-            groups = _group_by_display(candidates, records)
-            asks.append(
-                TownAsk(
-                    query=item.query,
-                    normalized=item.normalized,
-                    options=[records[g[0].town_id].display for g in groups],
+            groups = group_by_display(candidates, records)
+            pending.append(
+                _Pending(
+                    ask=TownAsk(
+                        query=item.query,
+                        normalized=item.normalized,
+                        options=[records[g[0].town_id].display for g in groups],
+                    ),
+                    item=item,
+                    groups=groups,
                 )
             )
-            ask_items.append(item)
-            ask_groups.append(groups)
 
-        if asks and self._reranker is not None:
-            result = await self._reranker.pick_towns(asks)
-            _merge_usage(outcome.usage, result.usage)
-            for index, item in enumerate(ask_items):
-                groups = ask_groups[index]
-                decision = result.decisions[index] if index < len(result.decisions) else None
-                if decision is None:
-                    # Jev が答えを返さなかった。語彙スコア最上位で代替する。
-                    item.town = records[groups[0][0].town_id]
-                    item.tail = parse_tail(groups[0][0].remainder)
-                    item.result.note = _failure_note(result.failure)
-                    item.town_decision = Decision(
-                        index=0, probability=0.0, confidence=0.0, contains_answer=0.0
-                    )
-                    continue
-                item.town_decision = decision
-                if decision.index is not None and 0 <= decision.index < len(groups):
-                    group = groups[decision.index]
-                    chosen = group[0]
-                    item.town = records[chosen.town_id]
-                    item.tail = parse_tail(chosen.remainder)
-                    if len(group) > 1:
-                        # 住所の表記は決まったが、どの machiaza_id かは
-                        # 入力からは決められない。代表の座標を返す。
-                        item.result.note = item.result.note or (
-                            f"同名の町字が {len(group)} 件あり、座標は代表のもの"
-                        )
-        elif asks:
-            # モデルが無い（索引だけで動かしている）場合も語彙スコア最上位。
-            for index, item in enumerate(ask_items):
-                first = ask_groups[index][0][0]
-                item.town = records[first.town_id]
-                item.tail = parse_tail(first.remainder)
-                item.town_decision = Decision(
-                    index=0, probability=0.0, confidence=0.0, contains_answer=0.0
-                )
-                item.result.note = "判定モデル未設定のため語彙スコア最上位を採用"
+        if not pending:
+            return
+        if self._reranker is None:
+            # モデルが無い（索引だけで動かしている）場合は候補の先頭。
+            for p in pending:
+                _accept_top(p, records, "判定モデル未設定のため候補の先頭を採用")
+            return
 
-    def _load_numbers(self, items: Sequence[_Item]) -> None:
+        result = await self._reranker.pick_towns([p.ask for p in pending])
+        outcome.usage.merge(result.usage)
+        if not result.decisions:
+            # 答えが返らなかった。候補の先頭で代替する。
+            for p in pending:
+                _accept_top(p, records, _failure_note(result.failure))
+            return
+
+        for p, decision in zip(pending, result.decisions, strict=True):
+            p.item.town_decision = decision
+            if decision.index is None or not 0 <= decision.index < len(p.groups):
+                continue
+            group = p.groups[decision.index]
+            _accept(p.item, records, group[0], decision)
+            if len(group) > 1:
+                # 住所の表記は決まったが、どの machiaza_id かは入力からは
+                # 決められない。代表の座標を返す。
+                p.item.remember(f"同名の町字が {len(group)} 件あり、座標は代表のもの")
+
+    def _load_numbers(self, items: Sequence[Resolution]) -> None:
         """確定した町字について層2 を引く。1 町字につき BLOB 1 本。"""
         for item in items:
-            town = item.town
-            tail = item.tail
+            town, tail = item.town, item.tail
             if town is None or tail is None or not tail.numbers:
                 continue
             if not town.from_abr:
                 # Geolonia から補った町字は ABR の machiaza_id を持たないので、
                 # 層2（街区・住居番号・地番）を引けない。町字で止める。
                 continue
-            if not self._town_is_confident(item):
+            if not item.town_is_confident(self._cfg):
                 continue
-            entries, kind = self._fetch_numbers(town, tail)
-            item.entries = entries
-            item.kind = kind
+            item.numbers = numbers.options_for(self._index.store, town, tail)
 
-    def _fetch_numbers(self, town: TownRecord, tail: Tail) -> tuple[list[NumberEntry], NumberKind]:
-        """町字にぶら下がる番号を引く。
-
-        ABR が同じ場所を「字青野」「青野」の 2 レコードに分けている場合、
-        **地番も 2 つに割れている**（栗原市築館新田は字あり側 324 筆、字なし側
-        に別の 10 筆）。:attr:`TownRecord.machiaza_ids` を順に引き、入力に
-        ぴったり合うものが出たところで止める。
-        """
-        kind = town.number_kind
-        best: list[NumberEntry] = []
-        best_kind = kind
-        for machiaza_id in town.machiaza_ids:
-            found, found_kind = self._fetch_one(town.lg_code, machiaza_id, kind, tail)
-            if _has_exact(found, tail.numbers):
-                return found, found_kind
-            if found and not best:
-                best, best_kind = found, found_kind
-        return best, best_kind
-
-    def _fetch_one(
-        self, lg_code: int, machiaza_id: int, kind: NumberKind, tail: Tail
-    ) -> tuple[list[NumberEntry], NumberKind]:
-        entries = self._index.store.fetch_numbers(lg_code, machiaza_id, kind, num1=tail.first)
-        if kind is NumberKind.RSDT and not _has_exact(entries, tail.numbers):
-            # 住居表示実施区域でも街区までしか無い町字、住居表示と地番の
-            # 両方を持つ町字（全国 1,248 件）、そして「街区だけ入力されて
-            # 住居番号が無い」場合があるので順に落とす。
-            for fallback in (NumberKind.BLOCK, NumberKind.PARCEL):
-                alternative = self._index.store.fetch_numbers(
-                    lg_code, machiaza_id, fallback, num1=tail.first
-                )
-                if _has_exact(alternative, tail.numbers):
-                    return alternative, fallback
-                entries = entries or alternative
-                if entries is alternative and alternative:
-                    kind = fallback
-        return entries, kind
-
-    async def _resolve_numbers(self, items: Sequence[_Item], outcome: BatchOutcome) -> None:
-        asks: list[NumberAsk] = []
-        ask_items: list[_Item] = []
-        ask_entries: list[list[NumberEntry]] = []
-
+    async def _resolve_numbers(self, items: Sequence[Resolution], outcome: BatchOutcome) -> None:
+        pending: list[_Pending[NumberAsk]] = []
         for item in items:
-            if not item.entries or item.town is None or item.tail is None:
+            options, tail, town = item.numbers, item.tail, item.town
+            if options is None or not options or tail is None or town is None:
                 continue
-            entries = _rank_entries(item.entries, item.tail.numbers, self._cfg.max_candidates)
-            exact = [e for e in entries if e.numbers == item.tail.numbers]
-            if not exact and not self._cfg.always_rerank and not item.tail.skipped:
+            options = numbers.ranked(options, tail.numbers, self._cfg.max_candidates)
+            item.numbers = options
+            exact = numbers.exact(options, tail.numbers)
+
+            if not exact and not self._cfg.always_rerank and not tail.skipped:
                 # **入力が候補の番号列の先頭になっている。** 「中砂見936番地」に
                 # 対し ABR は 936-1 / 936-2 / 936-3 しか持たない、という型。
                 # 親番は入力どおりで、枝番が分からないだけなので、Jev に
@@ -419,344 +335,78 @@ class Geocoder:
                 # 数字の手前を読み飛ばしている場合（ABR に無い小字が残って
                 # いる等）は町字の解釈が不完全なので、ここでは確定させずに
                 # Jev へ回す。
-                parents = _parent_matches(entries, item.tail.numbers)
+                parents = numbers.parents(options, tail.numbers)
                 if parents:
-                    item.entries = parents
+                    item.numbers = options.narrowed(parents)
                     item.number_parent = True
-                    item.number_decision = Decision(
-                        index=0,
-                        probability=1.0,
-                        confidence=1.0,
-                        contains_answer=1.0,
-                        fast_path=True,
-                    )
+                    item.number_decision = Decision.fast()
                     outcome.number_fast_path += 1
                     continue
+
             if len(exact) == 1 and not self._cfg.always_rerank:
                 # 入力の数値列が実在レコードと完全一致。選ぶ余地が無い。
-                item.entries = exact
-                item.number_decision = Decision(
-                    index=0, probability=1.0, confidence=1.0, contains_answer=1.0, fast_path=True
-                )
+                item.numbers = options.narrowed(exact)
+                item.number_decision = Decision.fast()
                 outcome.number_fast_path += 1
                 continue
-            item.entries = entries
-            asks.append(
-                NumberAsk(
-                    query=item.query,
-                    town=item.town.display,
-                    tail=item.tail.raw,
-                    kind=item.kind or item.town.number_kind,
-                    options=[e.display for e in entries],
+
+            pending.append(
+                _Pending(
+                    ask=NumberAsk(
+                        query=item.query,
+                        town=town.display,
+                        tail=tail.raw,
+                        kind=options.kind,
+                        options=[e.display for e in options.entries],
+                    ),
+                    item=item,
                 )
             )
-            ask_items.append(item)
-            ask_entries.append(entries)
 
-        if not asks:
-            self._assemble(items)
+        if not pending:
             return
-
         if self._reranker is None:
-            for item in ask_items:
-                item.number_decision = Decision(
-                    index=None, probability=0.0, confidence=0.0, contains_answer=0.0
-                )
-            self._assemble(items)
+            for p in pending:
+                p.item.number_decision = Decision.unanswered()
             return
 
-        result = await self._reranker.pick_numbers(asks)
-        _merge_usage(outcome.usage, result.usage)
-        for index, item in enumerate(ask_items):
-            decision = result.decisions[index] if index < len(result.decisions) else None
-            if decision is None:
-                item.number_decision = Decision(
-                    index=None, probability=0.0, confidence=0.0, contains_answer=0.0
-                )
-                if result.failure and not item.result.note:
-                    item.result.note = _failure_note(result.failure)
-                continue
-            item.number_decision = decision
-        self._assemble(items)
-
-    # ------------------------------------------------------------- 組み立て
-
-    def _town_is_confident(self, item: _Item) -> bool:
-        decision = item.town_decision
-        if item.town is None or decision is None:
-            return False
-        if decision.fast_path:
-            return True
-        return (
-            decision.confidence >= self._cfg.town_confidence
-            and decision.contains_answer >= self._cfg.present_threshold
-        )
-
-    def _assemble(self, items: Sequence[_Item]) -> None:
-        for item in items:
-            self._assemble_one(item)
-
-    def _assemble_one(self, item: _Item) -> None:
-        result = item.result
-        town = item.town
-
-        if town is None:
-            self._fill_coarse(item)
+        result = await self._reranker.pick_numbers([p.ask for p in pending])
+        outcome.usage.merge(result.usage)
+        if not result.decisions:
+            for p in pending:
+                p.item.number_decision = Decision.unanswered()
+                p.item.remember(_failure_note(result.failure))
             return
-
-        city = self._index.city_by_lg(town.lg_code)
-        if not self._town_is_confident(item):
-            # 確信が持てないときは結果を捨てず、粒度を 1 段上げて返す。
-            decision = item.town_decision
-            self._fill_city(result, town, city)
-            if decision is not None:
-                # 既に理由が入っている（Jev の不調など）ならそちらを残す。
-                result.note = result.note or _low_confidence_note("町字", decision, town.display)
-            return
-
-        result.pref = town.pref
-        result.county = town.county
-        result.city = town.city
-        result.ward = town.ward
-        result.town = town.town
-        result.lg_code = town.lg_code_str
-        result.machiaza_id = town.machiaza_code
-        result.point = town.point or (city.point if city else None)
-        result.level = Level.MACHIAZA
-        result.resolved = True
-        result.confidence = item.town_decision.confidence if item.town_decision else 0.0
-        result.probability = item.town_decision.probability if item.town_decision else 0.0
-        result.rest = item.tail.raw if item.tail else ""
-
-        self._fill_number(item, result, town)
-
-    def _fill_number(self, item: _Item, result: GeocodeResult, town: TownRecord) -> None:
-        decision = item.number_decision
-        if decision is None or not item.entries:
-            return
-        if decision.index is None or not 0 <= decision.index < len(item.entries):
-            if decision.contains_answer and decision.contains_answer < self._cfg.present_threshold:
-                result.note = result.note or "番号が候補に見つからない"
-            return
-        if not decision.fast_path and decision.confidence < self._cfg.number_confidence:
-            result.note = result.note or _low_confidence_note(
-                "番号", decision, item.entries[decision.index].display
-            )
-            return
-
-        entry = item.entries[decision.index]
-        kind = item.kind or town.number_kind
-        numbers = item.tail.numbers if (item.number_parent and item.tail) else entry.numbers
-        result.number = _format_number(kind, numbers)
-        result.level = _level_for(kind, numbers)
-        result.confidence = decision.confidence
-        result.probability = decision.probability
-        if entry.point is not None:
-            result.point = entry.point
-        if item.number_parent:
-            # 枝番は入力に無いので ABR の ID は付けない。座標は代表のもの。
-            result.note = result.note or (
-                f"枝番は入力に含まれない。{len(item.entries)} 件のうち代表の座標"
-            )
-        elif kind is NumberKind.PARCEL:
-            result.prc_id = entry.prc_id()
-        else:
-            result.blk_id = entry.blk_id()
-            if kind is NumberKind.RSDT:
-                result.rsdt_id = entry.rsdt_id()
-                result.rsdt2_id = entry.rsdt2_id()
-        result.rest = _rest_after_numbers(item.tail.raw if item.tail else "", entry)
-
-    def _fill_coarse(self, item: _Item) -> None:
-        """町字が決まらなかったとき、分かるところまでを返す。"""
-        result = item.result
-        city_id = item.candidates.city_id
-        if city_id is not None:
-            city = self._index.city(city_id)
-            if city is not None:
-                result.pref = city.pref
-                result.county = city.county
-                result.city = city.city
-                result.ward = city.ward
-                result.lg_code = f"{city.lg_code:06d}"
-                result.point = city.point
-                result.level = Level.CITY
-                _mark_exhausted(result, item.candidates.exhausted, Level.CITY, "町字")
-                return
-        lg_code = item.candidates.pref_lg_code
-        if lg_code is not None:
-            pref = self._index.pref_by_lg(lg_code)
-            if pref is not None:
-                result.pref = pref.pref
-                result.lg_code = f"{pref.lg_code:06d}"
-                result.point = pref.point
-                result.level = Level.PREF
-                _mark_exhausted(result, item.candidates.exhausted, Level.PREF, "市区町村")
-                return
-        result.level = Level.UNKNOWN
-        result.note = result.note or "候補が見つからない"
-
-    def _fill_city(self, result: GeocodeResult, town: TownRecord, city: CityRecord | None) -> None:
-        result.pref = town.pref
-        result.county = town.county
-        result.city = town.city
-        result.ward = town.ward
-        result.lg_code = town.lg_code_str
-        result.point = city.point if city else town.point
-        result.level = Level.CITY
-        result.resolved = False
+        for p, decision in zip(pending, result.decisions, strict=True):
+            p.item.number_decision = decision
 
 
 # ------------------------------------------------------------------ 補助
 
 
-def _group_by_display(
-    candidates: Sequence[TownCandidate], records: dict[int, TownRecord]
-) -> list[list[TownCandidate]]:
-    """候補を表示住所ごとにまとめる。出現順を保つ。
-
-    同じ文字列の選択肢を Jev に複数見せても選びようがないので、1 つにまとめる。
-    """
-    groups: dict[str, list[TownCandidate]] = {}
-    for candidate in candidates:
-        groups.setdefault(records[candidate.town_id].display, []).append(candidate)
-    return list(groups.values())
-
-
-def _group_by_oaza(
-    candidates: Sequence[TownCandidate], records: dict[int, TownRecord]
-) -> list[list[TownCandidate]]:
-    """候補を大字ごとにまとめる。出現順を保つ。"""
-    groups: dict[str, list[TownCandidate]] = {}
-    for candidate in candidates:
-        groups.setdefault(records[candidate.town_id].oaza_display, []).append(candidate)
-    return list(groups.values())
-
-
-def _with_candidates(base: CandidateSet, candidates: list[TownCandidate]) -> CandidateSet:
-    return CandidateSet(
-        candidates=candidates,
-        exact=base.exact,
-        city_id=base.city_id,
-        pref_lg_code=base.pref_lg_code,
-        exhausted=base.exhausted,
-        needs_beam=False,
-    )
-
-
-def _without_candidates(base: CandidateSet) -> CandidateSet:
-    return _with_candidates(base, [])
-
-
-def _merge_usage(target: Usage, source: Usage) -> None:
-    target.input_tokens += source.input_tokens
-    target.output_tokens += source.output_tokens
-    target.requests += source.requests
-
-
-def _mark_exhausted(
-    result: GeocodeResult, exhausted: Level | None, level: Level, missing: str
+def _accept(
+    item: Resolution,
+    records: dict[int, TownRecord],
+    candidate: TownCandidate,
+    decision: Decision,
 ) -> None:
-    """入力がこの粒度で尽きていたなら解決済みとし、そうでなければ理由を残す。"""
-    if exhausted is level:
-        result.resolved = True
-        result.confidence = 1.0
-        result.probability = 1.0
-    else:
-        result.note = result.note or f"{missing}を特定できない"
+    """町字を採る。残りは数値テールとして解釈する。"""
+    item.town = records[candidate.town_id]
+    item.tail = parse_tail(candidate.remainder)
+    item.town_decision = decision
+
+
+def _accept_top(p: _Pending[TownAsk], records: dict[int, TownRecord], note: str) -> None:
+    """候補の先頭（索引がいちばん近いと見たもの）を採る。
+
+    確信度 0 の :meth:`Decision.unverified` なので、:mod:`assemble` が粒度を
+    1 段上げて返す。**モデルの不調で例外を投げない**ための退避路。
+    """
+    _accept(p.item, records, p.groups[0][0], Decision.unverified())
+    p.item.remember(note)
 
 
 def _failure_note(failure: str) -> str:
     if not failure:
-        return "判定モデルが応答しなかったため語彙スコア最上位を採用"
-    return f"判定モデルが応答しなかったため語彙スコア最上位を採用: {failure}"
-
-
-def _low_confidence_note(what: str, decision: Decision, guess: str) -> str:
-    return f"{what}の確信度が低い ({decision.confidence:.2f}): 最有力は {guess}"
-
-
-def _level_for(kind: NumberKind, numbers: Sequence[int]) -> Level:
-    """入力がどこまで特定できたかに応じた粒度。
-
-    住居表示で街区しか与えられていないとき (「面影一丁目1番」) は、住居番号
-    ではなく街区として返す。地番は枝番が無くても地番のまま。
-    """
-    if kind is NumberKind.RSDT and len(tuple(numbers)) < 2:
-        return Level.BLOCK
-    return kind.level
-
-
-def _has_exact(entries: Sequence[NumberEntry], numbers: Sequence[int]) -> bool:
-    target = tuple(numbers)
-    return any(e.numbers == target for e in entries)
-
-
-def _parent_matches(entries: Sequence[NumberEntry], numbers: Sequence[int]) -> list[NumberEntry]:
-    """入力の番号列を先頭に持つ候補。入力が親番までのときに使う。
-
-    「中砂見936番地」(936,) に対して 936-1 / 936-2 / 936-3 が返る。番号の
-    並びとしては入力どおりで、枝番が分からないだけなので、どれを選ぶかを
-    Jev に訊いても答えようがない。
-    """
-    target = tuple(numbers)
-    if not target:
-        return []
-    return [e for e in entries if e.numbers[: len(target)] == target and e.numbers != target]
-
-
-def _format_number(kind: NumberKind, numbers: Sequence[int]) -> str:
-    parts: tuple[int, ...] = tuple(numbers)
-    if len(parts) == 0:
-        return ""
-    if kind is NumberKind.BLOCK:
-        return f"{parts[0]}番"
-    if kind is NumberKind.RSDT:
-        if len(parts) < 2:
-            return f"{parts[0]}番"
-        out = f"{parts[0]}番{parts[1]}号"
-        return out + (f"の{parts[2]}" if len(parts) > 2 and parts[2] else "")
-    return "-".join(str(n) for n in parts) + "番地"
-
-
-#: 番号の直後に付く助数詞。採用した番号と一緒に消費する。
-_TRAILING_UNITS = ("丁目", "番地", "番", "号室", "号", "地割", "の", "ノ")
-_REST_TRIM = "-ー−–—―‐ 　,、"
-
-
-def _rest_after_numbers(tail: str, entry: NumberEntry) -> str:
-    """番号として消費した部分より後ろを残りとして返す。
-
-    どこまでが住所かは Jev が判断済みなので、ここでは採用された番号の個数分だけ
-    数値を読み飛ばし、最後の数値に続く助数詞も一緒に落とす。
-    """
-    pos = 0
-    for _ in range(len(entry.numbers)):
-        match = _DIGITS.search(tail, pos)
-        if match is None:
-            return ""
-        pos = match.end()
-    rest = tail[pos:]
-    for unit in _TRAILING_UNITS:
-        if rest.startswith(unit):
-            rest = rest[len(unit) :]
-            break
-    return rest.strip(_REST_TRIM)
-
-
-def _rank_entries(
-    entries: Sequence[NumberEntry], numbers: Sequence[int], limit: int
-) -> list[NumberEntry]:
-    """候補が上限を超える場合に、入力の数値列に近いものを優先して残す。"""
-    if len(entries) <= limit:
-        return list(entries)
-
-    def distance(entry: NumberEntry) -> tuple[int, int, int]:
-        target = tuple(numbers) + (0, 0, 0)
-        return (
-            abs(entry.num1 - target[0]),
-            abs(entry.num2 - target[1]),
-            abs(entry.num3 - target[2]),
-        )
-
-    return sorted(entries, key=distance)[:limit]
+        return "判定モデルが応答しなかったため候補の先頭を採用"
+    return f"判定モデルが応答しなかったため候補の先頭を採用: {failure}"

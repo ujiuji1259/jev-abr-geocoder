@@ -114,9 +114,7 @@ async def test_low_confidence_raises_granularity(data_dir: Path) -> None:
 
 async def test_none_option_rejects_the_candidate_set(data_dir: Path) -> None:
     """Jev が「該当なし」を選んだら町字を採用しない。"""
-    from jev_abr_geocoder.config import NONE_OPTION
-
-    model = FakeModel(picks={"q0": NONE_OPTION})
+    model = FakeModel(picks={0: None})
     with _geocoder(data_dir, model, always_rerank=True) as geocoder:
         result = await geocoder.geocode("鳥取県鳥取市面影1丁目1-2")
     assert result.level <= Level.CITY
@@ -183,21 +181,21 @@ async def test_kanji_chome_resolves_end_to_end(data_dir: Path) -> None:
     assert result.level is Level.MACHIAZA
 
 
-async def test_choice_never_exceeds_the_api_limit(data_dir: Path, model: FakeModel) -> None:
-    """Choice の選択肢は「該当なし」を含めて 255 件を超えてはならない。
+async def test_options_leave_room_for_the_none_option(data_dir: Path, model: FakeModel) -> None:
+    """判定モデルに渡す候補は max_candidates 件を超えてはならない。
 
-    超えると API が 400 を返し、**バッチ全体が失敗する**。候補を 255 件に
-    切ってから NONE_OPTION を足して 256 になる off-by-one を踏んだので、
-    ここで固定する。
+    アダプタが「該当なし」を 1 枠足すので、候補が max_options 件だと Choice が
+    256 件になって API が 400 を返し、**バッチ全体が失敗する**。この off-by-one を
+    実際に踏んだので、ポートの入口で固定する。アダプタ側の上限は
+    tests/test_jev.py で押さえている。
     """
-    from jev_abr_geocoder.match.rerank import MAX_CHOICE_OPTIONS
-
+    cfg = GeocoderConfig()
     with _geocoder(data_dir, model, always_rerank=True) as geocoder:
         await geocoder.geocode("東京都目黒区自由が丘")
-    assert model.calls, "Jev が呼ばれていない"
-    for _state, questions in model.calls:
-        for question in questions.values():
-            assert len(question.criteria) <= MAX_CHOICE_OPTIONS
+    assert model.calls, "判定モデルが呼ばれていない"
+    for questions in model.calls:
+        for question in questions:
+            assert len(question.options) <= cfg.max_candidates
 
 
 def test_max_candidates_leaves_room_for_the_none_option() -> None:
@@ -219,9 +217,9 @@ async def test_beam_narrows_a_big_city_in_one_extra_round(data_dir: Path, model:
     assert outcome.beam_requests == 1
     # beam 1 回 + 町字 1 回。番号は町字が決まってから。
     assert model.request_count <= 3
-    for _state, questions in model.calls:
-        for question in questions.values():
-            assert len(question.criteria) <= cfg.max_options
+    for questions in model.calls:
+        for question in questions:
+            assert len(question.options) <= cfg.max_candidates
 
 
 async def test_beam_disabled_falls_back_to_city(data_dir: Path, model: FakeModel) -> None:
@@ -281,7 +279,7 @@ async def test_many_queries_are_split_into_batches(data_dir: Path, model: FakeMo
     assert len(results) == 10
     # 10 件を 4 件ずつ = 3 バッチ。各バッチが町字と番号で最大 2 往復。
     assert model.request_count <= 6
-    for _state, questions in model.calls:
+    for questions in model.calls:
         assert len(questions) <= 4
 
 

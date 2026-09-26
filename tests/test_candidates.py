@@ -49,7 +49,7 @@ def test_typo_hands_the_whole_city_to_jev(index: TownIndex) -> None:
     """
     found = _finder(index).find(normalize("鳥取県鳥取市面かげ1丁目1-2"))
     assert not found.exact
-    assert found.city_id is not None
+    assert found.city_lg_code is not None
     displays = _displays(index, normalize("鳥取県鳥取市面かげ1丁目1-2"))
     assert "鳥取県鳥取市面影一丁目" in displays  # 正解が候補に入っている
     assert "鳥取県鳥取市叶" in displays  # 同じ市の町字は全部入る
@@ -74,14 +74,14 @@ def test_city_wide_gives_up_when_beam_is_disabled(index: TownIndex) -> None:
     cfg = GeocoderConfig(max_options=3, beam=False)
     found = CandidateFinder(index, cfg).find(normalize("鳥取県鳥取市面かげ1丁目1-2"))
     assert found.candidates == []
-    assert found.city_id is not None
+    assert found.city_lg_code is not None
 
 
 def test_input_ending_at_city_yields_no_town_candidates(index: TownIndex) -> None:
     found = _finder(index).find(normalize("鳥取県鳥取市"))
     assert found.candidates == []
     assert found.exhausted is Level.CITY
-    assert found.city_id is not None
+    assert found.city_lg_code is not None
 
 
 def test_input_ending_at_pref_yields_pref_level(index: TownIndex) -> None:
@@ -95,7 +95,7 @@ def test_non_address_yields_nothing(index: TownIndex) -> None:
     found = _finder(index).find(normalize("ここは住所ではありません"))
     assert found.candidates == []
     assert found.exhausted is None
-    assert found.city_id is None
+    assert found.city_lg_code is None
 
 
 def test_candidates_never_exceed_the_choice_limit(index: TownIndex) -> None:
@@ -165,7 +165,7 @@ def test_unknown_city_yields_pref_only(index: TownIndex) -> None:
     found = _finder(index).find(normalize("鳥取県そんな市は無い町1-2"))
     assert found.candidates == []
     assert found.pref_lg_code is not None
-    assert found.city_id is None
+    assert found.city_lg_code is None
 
 
 def test_prefix_match_never_splits_a_number(index: TownIndex) -> None:

@@ -13,17 +13,18 @@ ABR が持つ列から機械的に鍵を増やすことで表現する。ロジ�
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
 
+from ..models import CityName, TownName
 from ..textnorm import normalize
 
 __all__ = [
-    "TownName",
-    "CityName",
     "town_aliases",
     "city_aliases",
     "pref_variants",
     "kanji_number",
+    "without_prefix",
+    "match_key",
 ]
 
 #: 都道府県名の接尾辞。「岩手花巻市」のように省略されることがある。
@@ -35,30 +36,6 @@ _PREF_SUFFIXES = ("都", "道", "府", "県")
 #: 長い方から試す。
 _OAZA_PREFIXES = ("大字", "字")
 _KOAZA_PREFIXES = ("字",)
-
-
-@dataclass(frozen=True, slots=True)
-class CityName:
-    pref: str
-    county: str
-    city: str
-    ward: str
-
-
-@dataclass(frozen=True, slots=True)
-class TownName:
-    pref: str
-    county: str
-    city: str
-    ward: str
-    oaza_cho: str
-    chome: str
-    chome_number: str
-    koaza: str
-
-    @property
-    def city_name(self) -> CityName:
-        return CityName(self.pref, self.county, self.city, self.ward)
 
 
 def pref_variants(pref: str) -> tuple[str, ...]:
@@ -106,6 +83,64 @@ def kanji_number(value: int) -> str:
     if value:
         out += _KANJI_DIGITS[value]
     return out
+
+
+_KANJI_RUN = re.compile(r"([〇零一二三四五六七八九十百千]+)")
+#: ケ/ヶ/ガ の揺れ。突き合わせのときだけ 1 つに寄せる。
+_KANA_FOLD = str.maketrans({"ヶ": "ケ", "ガ": "ケ", "が": "ケ"})
+
+
+def without_prefix(value: str) -> str:
+    """大字・字の接頭辞を落とす。
+
+    >>> without_prefix("大字福井"), without_prefix("字上町"), without_prefix("青野")
+    ('福井', '上町', '青野')
+
+    「大字」「字」は小字であることを示す構造の印で名前の一部ではないので、
+    **同じ場所かどうかを見るときは落としてから比べる。**
+    """
+    return _strip_variants(value, _OAZA_PREFIXES)[-1]
+
+
+def match_key(city: str, *parts: str) -> str:
+    """別のデータと町字を突き合わせる鍵。**索引の鍵ではない。**
+
+    大字・字は **段ごとに落としてから** つなぐ。ABR が
+    ``oaza_cho='古川清水', koaza='字新田'``、Geolonia が
+    ``town='古川清水', koaza='新田'`` のように持つので、つないでから落とすと
+    「字」が中に残って一致しない。段の切り方自体がずれている（ABR が大字＋
+    小字、Geolonia が大字ひとつ）場合も、つないだ結果が同じなら同じ場所と
+    みなす。丁目の漢数字・算用数字の違いとケ/ヶ の揺れも吸収する。
+
+    >>> match_key("海老名市", "柏ケ谷", "一丁目")
+    '海老名市柏ケ谷1丁目'
+    >>> match_key("海老名市", "柏ヶ谷1丁目")
+    '海老名市柏ケ谷1丁目'
+    """
+    folded = "".join(without_prefix(_fold_numbers(p)) for p in parts)
+    return normalize(city + folded).translate(_KANA_FOLD)
+
+
+def _fold_numbers(text: str) -> str:
+    """漢数字を算用数字に寄せる。突き合わせ専用。"""
+    return _KANJI_RUN.sub(lambda m: str(_kanji_value(m.group(1))), normalize(text))
+
+
+def _kanji_value(text: str) -> int:
+    """漢数字を整数にする。:func:`kanji_number` の逆。"""
+    total = 0
+    current = 0
+    for ch in text:
+        if ch in _KANJI_DIGITS:
+            current = _KANJI_DIGITS.index(ch)
+        elif ch in _KANJI_UNITS:
+            unit = _KANJI_UNITS[ch]
+            total += (current or 1) * unit
+            current = 0
+    return total + current
+
+
+_KANJI_UNITS = {"十": 10, "百": 100, "千": 1000}
 
 
 def _chome_variants(chome: str, chome_number: str) -> tuple[str, ...]:

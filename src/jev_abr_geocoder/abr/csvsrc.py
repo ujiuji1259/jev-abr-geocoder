@@ -12,7 +12,7 @@ import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 
-__all__ = ["read_rows", "count_rows"]
+__all__ = ["read_rows"]
 
 # 地番マスターの備考欄など、既定の上限を超えるフィールドがあり得る。
 csv.field_size_limit(10_000_000)
@@ -28,7 +28,3 @@ def read_rows(path: Path) -> Iterator[dict[str, str]]:
             with archive.open(name) as raw:
                 stream = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
                 yield from csv.DictReader(stream)
-
-
-def count_rows(path: Path) -> int:
-    return sum(1 for _ in read_rows(path))

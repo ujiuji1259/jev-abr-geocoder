@@ -13,16 +13,16 @@ import asyncio
 import json
 import os
 import sys
+from contextlib import closing
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
+from . import adapters, ports
 from ._version import __version__
 from .config import GeocoderConfig
 from .geocoder import Geocoder
-from .index.store import DB_FILENAME, Store
-from .match.rerank import DecisionModel, JevModel
 from .models import GeocodeResult
 
 app = typer.Typer(
@@ -140,19 +140,19 @@ def normalize(
 @app.command()
 def info(data_dir: DataDir = _DEFAULT_DATA_DIR) -> None:
     """索引の版・件数・取得日時を表示する。"""
-    db = data_dir / DB_FILENAME
+    db = adapters.index_path(data_dir)
     if not db.exists():
         typer.echo(f"索引が無い: {db}", err=True)
         raise typer.Exit(1)
-    with Store.open(db, readonly=True) as store:
-        meta = store.all_meta()
+    with closing(adapters.open_reader(data_dir)) as store:
+        meta = store.meta()
         lines = [f"パッケージ  : {__version__}", f"索引        : {data_dir}"]
         for key in ("schema_version", "builder_version", "level", "built_at"):
             if key in meta:
                 lines.append(f"{key:12}: {meta[key]}")
         lines.append(f"町字        : {store.town_count():,}")
         lines.append(f"番号        : {store.number_count():,}")
-        lines.append(f"取り込み済み: {len(store.ingested_sources()):,} ファイル")
+        lines.append(f"取り込み済み: {len(store.sources()):,} ファイル")
         if "geolonia_attribution" in meta:
             lines.append("")
             lines.append(meta["geolonia_attribution"])
@@ -162,13 +162,13 @@ def info(data_dir: DataDir = _DEFAULT_DATA_DIR) -> None:
 # ------------------------------------------------------------------ 補助
 
 
-def _open_model(cfg: GeocoderConfig) -> DecisionModel | None:
+def _open_model(cfg: GeocoderConfig) -> ports.DecisionModel | None:
     if not os.environ.get("TYPESAFE_API_KEY"):
         typer.echo(
             "TYPESAFE_API_KEY が未設定のため、Jev を使わずトライの候補だけで判定する", err=True
         )
         return None
-    return JevModel.from_env(cfg)
+    return adapters.jev_model(cfg)
 
 
 def _human(result: GeocodeResult) -> str:

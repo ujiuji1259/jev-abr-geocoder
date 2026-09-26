@@ -10,21 +10,20 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-import httpx
+from .. import ports
 
 __all__ = [
     "FEED_URL",
     "DATA_HOST",
     "FileRef",
     "Scope",
-    "TEXT_KINDS",
-    "POS_KINDS",
     "BuildLevel",
     "kinds_for_level",
     "parse_feed",
@@ -56,12 +55,8 @@ class BuildLevel(str, Enum):
     PARCEL = "parcel"
 
 
-#: 住所文字列を持つマスター。
-TEXT_KINDS = ("mt_pref", "mt_city", "mt_town", "mt_rsdtdsp_blk", "mt_rsdtdsp_rsdt", "mt_parcel")
-
-#: 代表点を持つ位置参照拡張。``<text kind>_pos`` という命名規則。
-POS_KINDS = tuple(f"{kind}_pos" for kind in TEXT_KINDS)
-
+#: その深さで要る本体の種別。代表点を持つ位置参照拡張は ``<種別>_pos`` という
+#: 命名規則なので、:func:`kinds_for_level` が機械的に導く。
 _LEVEL_KINDS: dict[BuildLevel, tuple[str, ...]] = {
     BuildLevel.MACHIAZA: ("mt_pref", "mt_city", "mt_town"),
     BuildLevel.RSDT: ("mt_pref", "mt_city", "mt_town", "mt_rsdtdsp_blk", "mt_rsdtdsp_rsdt"),
@@ -137,10 +132,10 @@ def parse_feed(payload: dict[str, Any]) -> list[FileRef]:
     return out
 
 
-async def fetch_feed(client: httpx.AsyncClient) -> list[FileRef]:
+async def fetch_feed(client: ports.HttpClient) -> list[FileRef]:
     response = await client.get(FEED_URL, timeout=120.0)
     response.raise_for_status()
-    return parse_feed(response.json())
+    return parse_feed(json.loads(response.content))
 
 
 def select(

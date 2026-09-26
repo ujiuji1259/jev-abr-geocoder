@@ -1,9 +1,13 @@
-"""SQLite ストア。
+"""SQLite で :class:`ports.IndexReader` と :class:`ports.IndexWriter` を実装する。
 
 1 ファイルに層1 のレコード (``pref`` / ``city`` / ``town``) と層2 の番号 BLOB
 (``num_blob``) が入る。配布物は ``town.marisa`` とこの ``abr.db`` の 2 つだけ。
 
 読み取りは読み取り専用接続で開くので、複数ワーカーから安全に共有できる。
+
+**sqlite3 を import していいのはこのファイルだけ。** 行やカラムの形は外に
+出さず、境界では ``models.py`` の値型に直す。座標を 1e7 倍の整数で持つのも
+ここだけの事情なので、:class:`Point` との変換もここで閉じる。
 """
 
 from __future__ import annotations
@@ -13,12 +17,12 @@ from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from ..index import numblob
 from ..models import CityRecord, NumberEntry, NumberKind, Point, PrefRecord, TownRecord
-from . import numblob
 
-__all__ = ["Store", "SCHEMA_VERSION", "DB_FILENAME"]
+__all__ = ["SqliteStore", "SCHEMA_VERSION", "DB_FILENAME"]
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DB_FILENAME = "abr.db"
 
 _SCHEMA = """
@@ -44,8 +48,8 @@ CREATE TABLE IF NOT EXISTS pref(
 );
 
 CREATE TABLE IF NOT EXISTS city(
-    city_id INTEGER PRIMARY KEY,
-    lg_code INTEGER NOT NULL UNIQUE,
+    -- 全国地方公共団体コード。市区町村トライのペイロードと一致する。
+    lg_code INTEGER PRIMARY KEY,
     pref    TEXT NOT NULL,
     county  TEXT NOT NULL,
     city    TEXT NOT NULL,
@@ -54,7 +58,7 @@ CREATE TABLE IF NOT EXISTS city(
     lon_1e7 INTEGER
 );
 
--- town_id は marisa トライのペイロードと一致する。
+-- town_id は前方一致トライのペイロードと一致する。
 CREATE TABLE IF NOT EXISTS town(
     town_id       INTEGER PRIMARY KEY,
     lg_code       INTEGER NOT NULL,
@@ -94,29 +98,12 @@ CREATE TABLE IF NOT EXISTS num_blob(
 """
 
 
-def _schema_version(path: Path) -> int | None:
-    """既存 DB のスキーマ版。読めなければ None。"""
-    try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return None
-    try:
-        row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        return int(row[0]) if row else None
-    except (sqlite3.Error, TypeError, ValueError):
-        return None
-    finally:
-        conn.close()
-
-
-def _point(lat_1e7: int | None, lon_1e7: int | None) -> Point | None:
-    if lat_1e7 is None or lon_1e7 is None:
-        return None
-    return Point(lat=lat_1e7 / numblob.COORD_SCALE, lon=lon_1e7 / numblob.COORD_SCALE)
-
-
-class Store:
+class SqliteStore:
     """``abr.db`` への読み書き。
+
+    読み取りポートと書き込みポートを 1 クラスで実装する。同じスキーマの表裏
+    でしかないので分けても得が無いが、**呼び出し側はどちらかのポートとして
+    しか受け取らない**（``geocoder`` は読み取り、``build`` は書き込み）。
 
     読み取り専用で開いた場合、書き込み系メソッドは sqlite3 が例外を投げる。
     """
@@ -127,7 +114,7 @@ class Store:
     # ------------------------------------------------------------- 開閉
 
     @classmethod
-    def open(cls, path: Path, *, readonly: bool = True) -> Store:
+    def open(cls, path: Path, *, readonly: bool = True) -> SqliteStore:
         if readonly:
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
         else:
@@ -138,7 +125,7 @@ class Store:
         return cls(conn)
 
     @classmethod
-    def create(cls, path: Path) -> Store:
+    def create(cls, path: Path) -> SqliteStore:
         """書き込み用に開き、構築向けの PRAGMA を設定する。
 
         スキーマ版が変わっていたら作り直す。索引は ABR から何度でも組み直せる
@@ -151,6 +138,7 @@ class Store:
         store._conn.execute("PRAGMA journal_mode = OFF")
         store._conn.execute("PRAGMA synchronous = OFF")
         store._conn.execute("PRAGMA cache_size = -200000")
+        store.set_meta("schema_version", str(SCHEMA_VERSION))
         return store
 
     def close(self) -> None:
@@ -158,12 +146,6 @@ class Store:
 
     def commit(self) -> None:
         self._conn.commit()
-
-    def __enter__(self) -> Store:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
 
     # ------------------------------------------------------------- meta
 
@@ -174,11 +156,7 @@ class Store:
             (key, value),
         )
 
-    def get_meta(self, key: str) -> str | None:
-        row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-        return None if row is None else str(row["value"])
-
-    def all_meta(self) -> dict[str, str]:
+    def meta(self) -> dict[str, str]:
         return {str(r["key"]): str(r["value"]) for r in self._conn.execute("SELECT * FROM meta")}
 
     # ----------------------------------------------------------- source
@@ -199,7 +177,7 @@ class Store:
             (url, kind, last_modified, rows),
         )
 
-    def ingested_sources(self) -> dict[str, str | None]:
+    def sources(self) -> dict[str, str | None]:
         return {
             str(r["url"]): (r["last_modified"] and str(r["last_modified"]))
             for r in self._conn.execute("SELECT url, last_modified FROM source")
@@ -207,30 +185,43 @@ class Store:
 
     # ------------------------------------------------------- 書き込み
 
-    def replace_prefs(self, rows: Iterable[tuple[Any, ...]]) -> None:
+    def replace_prefs(self, records: Iterable[PrefRecord]) -> None:
         self._conn.execute("DELETE FROM pref")
-        self._conn.executemany("INSERT INTO pref VALUES(?, ?, ?, ?)", rows)
-
-    def replace_cities(self, rows: Iterable[tuple[Any, ...]]) -> None:
-        self._conn.execute("DELETE FROM city")
-        self._conn.executemany("INSERT INTO city VALUES(?, ?, ?, ?, ?, ?, ?, ?)", rows)
-
-    def replace_towns(self, rows: Iterable[Sequence[Any]]) -> None:
-        self._conn.execute("DELETE FROM town")
         self._conn.executemany(
-            "INSERT INTO town VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
+            "INSERT INTO pref VALUES(?, ?, ?, ?)",
+            ((r.lg_code, r.pref, *_coords(r.point)) for r in records),
         )
 
-    def put_numbers(
-        self, lg_code: int, machiaza_id: int, kind: NumberKind, entries: Sequence[NumberEntry]
-    ) -> None:
-        if not entries:
-            return
-        self._conn.execute(
-            "INSERT INTO num_blob(lg_code, machiaza_id, kind, n, data) VALUES(?, ?, ?, ?, ?) "
-            "ON CONFLICT(lg_code, machiaza_id, kind) DO UPDATE SET "
-            "  n = excluded.n, data = excluded.data",
-            (lg_code, machiaza_id, int(kind), len(entries), numblob.encode(entries)),
+    def replace_cities(self, records: Iterable[CityRecord]) -> None:
+        self._conn.execute("DELETE FROM city")
+        self._conn.executemany(
+            "INSERT INTO city VALUES(?, ?, ?, ?, ?, ?, ?)",
+            ((r.lg_code, r.pref, r.county, r.city, r.ward, *_coords(r.point)) for r in records),
+        )
+
+    def replace_towns(self, records: Iterable[TownRecord]) -> None:
+        self._conn.execute("DELETE FROM town")
+        self._conn.executemany(
+            "INSERT INTO town VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    r.town_id,
+                    r.lg_code,
+                    r.machiaza_id,
+                    r.pref,
+                    r.county,
+                    r.city,
+                    r.ward,
+                    r.oaza_cho,
+                    r.chome,
+                    r.koaza,
+                    r.rsdt_addr_flg,
+                    *_coords(r.point),
+                    r.source,
+                    ",".join(str(x) for x in r.alt_machiaza),
+                )
+                for r in records
+            ),
         )
 
     def put_numbers_many(
@@ -241,12 +232,7 @@ class Store:
             for lg, mz, kind, entries in items
             if entries
         ]
-        self._conn.executemany(
-            "INSERT INTO num_blob(lg_code, machiaza_id, kind, n, data) VALUES(?, ?, ?, ?, ?) "
-            "ON CONFLICT(lg_code, machiaza_id, kind) DO UPDATE SET "
-            "  n = excluded.n, data = excluded.data",
-            rows,
-        )
+        self._conn.executemany(_PUT_NUMBERS, rows)
         return len(rows)
 
     # --------------------------------------------------------- 読み取り
@@ -264,7 +250,6 @@ class Store:
     def cities(self) -> list[CityRecord]:
         return [
             CityRecord(
-                city_id=int(r["city_id"]),
                 lg_code=int(r["lg_code"]),
                 pref=str(r["pref"]),
                 county=str(r["county"]),
@@ -272,7 +257,7 @@ class Store:
                 ward=str(r["ward"]),
                 point=_point(r["lat_1e7"], r["lon_1e7"]),
             )
-            for r in self._conn.execute("SELECT * FROM city ORDER BY city_id")
+            for r in self._conn.execute("SELECT * FROM city ORDER BY lg_code")
         ]
 
     def towns(self, town_ids: Sequence[int]) -> dict[int, TownRecord]:
@@ -289,10 +274,6 @@ class Store:
                 record = _town_record(row)
                 out[record.town_id] = record
         return out
-
-    def town(self, town_id: int) -> TownRecord | None:
-        row = self._conn.execute("SELECT * FROM town WHERE town_id = ?", (town_id,)).fetchone()
-        return None if row is None else _town_record(row)
 
     def town_count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS n FROM town").fetchone()
@@ -322,12 +303,39 @@ class Store:
             return []
         return numblob.decode(bytes(row["data"]), num1=num1)
 
-    def has_numbers(self, lg_code: int, machiaza_id: int, kind: NumberKind) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM num_blob WHERE lg_code = ? AND machiaza_id = ? AND kind = ?",
-            (lg_code, machiaza_id, int(kind)),
-        ).fetchone()
-        return row is not None
+
+_PUT_NUMBERS = (
+    "INSERT INTO num_blob(lg_code, machiaza_id, kind, n, data) VALUES(?, ?, ?, ?, ?) "
+    "ON CONFLICT(lg_code, machiaza_id, kind) DO UPDATE SET "
+    "  n = excluded.n, data = excluded.data"
+)
+
+
+def _schema_version(path: Path) -> int | None:
+    """既存 DB のスキーマ版。読めなければ None。"""
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        return int(row[0]) if row else None
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+    finally:
+        conn.close()
+
+
+def _point(lat_1e7: Any, lon_1e7: Any) -> Point | None:
+    if lat_1e7 is None or lon_1e7 is None:
+        return None
+    return Point(lat=int(lat_1e7) / numblob.COORD_SCALE, lon=int(lon_1e7) / numblob.COORD_SCALE)
+
+
+def _coords(point: Point | None) -> tuple[int | None, int | None]:
+    if point is None:
+        return None, None
+    return round(point.lat * numblob.COORD_SCALE), round(point.lon * numblob.COORD_SCALE)
 
 
 def _town_record(row: sqlite3.Row) -> TownRecord:

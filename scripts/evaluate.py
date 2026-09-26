@@ -28,14 +28,15 @@ import json
 import re
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from jev_abr_geocoder import adapters, ports  # noqa: E402
 from jev_abr_geocoder.config import GeocoderConfig  # noqa: E402
 from jev_abr_geocoder.geocoder import Geocoder  # noqa: E402
-from jev_abr_geocoder.match.rerank import DecisionModel, JevModel  # noqa: E402
 from jev_abr_geocoder.models import GeocodeResult  # noqa: E402
 from jev_abr_geocoder.textnorm import normalize  # noqa: E402
 
@@ -49,23 +50,26 @@ csv.field_size_limit(10_000_000)
 
 
 class CountingModel:
-    """Jev 呼び出しの回数とトークンを数えるラッパ。"""
+    """Jev 呼び出しの回数とトークンを数えるラッパ。
 
-    def __init__(self, inner: DecisionModel) -> None:
+    :class:`ports.DecisionModel` を満たすので、そのまま Geocoder に差せる。
+    """
+
+    def __init__(self, inner: ports.DecisionModel) -> None:
         self._inner = inner
         self.requests = 0
         self.input_tokens = 0
         self.output_tokens = 0
         self.latencies: list[float] = []
 
-    async def ask(self, state: object, questions: object) -> object:
+    async def choose(self, questions: Sequence[ports.Question]) -> ports.ChoiceSet:
         started = time.perf_counter()
-        answers, tokens = await self._inner.ask(state, questions)  # type: ignore[arg-type]
+        result = await self._inner.choose(questions)
         self.latencies.append((time.perf_counter() - started) * 1000)
         self.requests += 1
-        self.input_tokens += tokens[0]
-        self.output_tokens += tokens[1]
-        return answers, tokens
+        self.input_tokens += result.usage.input_tokens
+        self.output_tokens += result.usage.output_tokens
+        return result
 
 
 @dataclass
@@ -157,10 +161,10 @@ async def run(
     use_model: bool,
     silver: dict[str, str] | None,
 ) -> Report:
-    model: DecisionModel | None = None
+    model: ports.DecisionModel | None = None
     counter: CountingModel | None = None
     if use_model:
-        counter = CountingModel(JevModel.from_env(cfg))
+        counter = CountingModel(adapters.jev_model(cfg))
         model = counter  # type: ignore[assignment]
 
     report = Report(total=len(queries))

@@ -5,13 +5,12 @@
 """
 
 from jev_abr_geocoder.index.keys import (
-    CityName,
-    TownName,
     city_aliases,
     kanji_number,
     pref_variants,
     town_aliases,
 )
+from jev_abr_geocoder.models import CityName, TownName
 
 
 def test_pref_variants_includes_omission_and_suffix_drop() -> None:

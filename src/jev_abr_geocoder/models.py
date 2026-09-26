@@ -1,4 +1,9 @@
-"""値型。すべて frozen dataclass で、可変状態を持たない。"""
+"""値型。
+
+入出力と途中結果の型をここに集める。**ABR のレコードと名前は frozen**（索引から
+読んだものを書き換える意味が無い）。段を追って埋まる :class:`GeocodeResult` /
+:class:`Usage` / :class:`BatchOutcome` だけが可変。
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,8 @@ from typing import Any
 
 __all__ = [
     "Level",
+    "CityName",
+    "TownName",
     "NumberKind",
     "Point",
     "PrefRecord",
@@ -15,9 +22,9 @@ __all__ = [
     "TownRecord",
     "NumberEntry",
     "TownCandidate",
-    "NumberCandidate",
     "Decision",
     "Usage",
+    "BatchOutcome",
     "GeocodeResult",
 ]
 
@@ -75,6 +82,42 @@ class Point:
     srid: str = "EPSG:6668"
 
 
+# ------------------------------------------------------------------ 住所の名前
+
+
+@dataclass(frozen=True, slots=True)
+class CityName:
+    """市区町村の名前。ABR の列をそのまま持つ。"""
+
+    pref: str
+    county: str
+    city: str
+    ward: str
+
+
+@dataclass(frozen=True, slots=True)
+class TownName:
+    """町字の名前。ABR の列をそのまま持つ。
+
+    ``chome_number`` は丁目の算用数字（``chome`` の表記が揺れるため別列で要る）。
+    エイリアス鍵を作るのに使うだけなので、永続化する :class:`TownRecord` には
+    含まれない。
+    """
+
+    pref: str
+    county: str
+    city: str
+    ward: str
+    oaza_cho: str
+    chome: str
+    chome_number: str
+    koaza: str
+
+    @property
+    def city_name(self) -> CityName:
+        return CityName(self.pref, self.county, self.city, self.ward)
+
+
 # ---------------------------------------------------------------- ABR レコード
 
 
@@ -87,17 +130,14 @@ class PrefRecord:
 
 @dataclass(frozen=True, slots=True)
 class CityRecord:
-    city_id: int
+    """市区町村。``lg_code``（全国地方公共団体コード）が同一性。"""
+
     lg_code: int
     pref: str
     county: str
     city: str
     ward: str
     point: Point | None = None
-
-    @property
-    def display(self) -> str:
-        return f"{self.pref}{self.county}{self.city}{self.ward}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,35 +265,46 @@ class NumberEntry:
 class TownCandidate:
     """層1 が出した町字候補。
 
-    ``score`` は 255 件に収まらないときに何を落とすかを決めるためだけのもので、
-    採否の判断には使わない。判断は Jev が行う（docs/architecture.md 原則1）。
+    **並び順が順位。** 索引に近いものから並び、上限を超えた分は後ろから落とす。
+    スコアは持たない。数値を持たせると「この値以上なら採用」と書きたくなり、
+    採否の判断が判定モデルからこちら側に漏れる（docs/architecture.md 原則1）。
     """
 
     town_id: int
+    #: 入力のうち町字として消費した部分
     matched: str
-    remainder: str
-    score: float
-
-
-@dataclass(frozen=True, slots=True)
-class NumberCandidate:
-    """層2 が出した番号候補。"""
-
-    kind: NumberKind
-    entry: NumberEntry
+    #: 残り（数値テール + 建物名）
     remainder: str
 
 
 @dataclass(frozen=True, slots=True)
 class Decision:
-    """Jev の判定結果。閾値との比較はここではなく geocoder が行う。"""
+    """判定モデルの結果。閾値との比較はここではなく geocoder が行う。"""
 
     index: int | None
     probability: float
     confidence: float
     contains_answer: float
-    #: Jev を呼ばずに決めた場合 True
+    #: モデルを呼ばずに決めた場合 True
     fast_path: bool = False
+
+    @classmethod
+    def fast(cls) -> Decision:
+        """選ぶ余地が無いので訊かずに決めた。確信度は満点で通す。"""
+        return cls(index=0, probability=1.0, confidence=1.0, contains_answer=1.0, fast_path=True)
+
+    @classmethod
+    def unverified(cls) -> Decision:
+        """モデルに訊けなかったので候補の先頭を採る。
+
+        確信度 0 なので、``geocoder`` は粒度を 1 段上げて返す。
+        """
+        return cls(index=0, probability=0.0, confidence=0.0, contains_answer=0.0)
+
+    @classmethod
+    def unanswered(cls) -> Decision:
+        """答えが得られなかった。何も採用しない。"""
+        return cls(index=None, probability=0.0, confidence=0.0, contains_answer=0.0)
 
 
 @dataclass(slots=True)
@@ -263,9 +314,15 @@ class Usage:
     requests: int = 0
 
     def add(self, input_tokens: int, output_tokens: int) -> None:
+        """1 リクエスト分を足す。"""
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
         self.requests += 1
+
+    def merge(self, other: Usage) -> None:
+        self.input_tokens += other.input_tokens
+        self.output_tokens += other.output_tokens
+        self.requests += other.requests
 
 
 # ---------------------------------------------------------------- 出力
@@ -358,3 +415,11 @@ class BatchOutcome:
     number_fast_path: int = 0
     #: 分割絞り込み (beam) のために増えた往復数
     beam_requests: int = 0
+
+    def merge(self, other: BatchOutcome) -> None:
+        """バッチの結果を後ろに繋ぐ。``run_all`` が並行実行の結果を畳む。"""
+        self.results.extend(other.results)
+        self.town_fast_path += other.town_fast_path
+        self.number_fast_path += other.number_fast_path
+        self.beam_requests += other.beam_requests
+        self.usage.merge(other.usage)

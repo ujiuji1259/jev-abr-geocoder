@@ -27,13 +27,19 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 
 from ..config import GeocoderConfig
 from ..index.townindex import TownIndex
-from ..models import Level, TownCandidate
+from ..models import Level, TownCandidate, TownRecord
 
-__all__ = ["CandidateFinder", "CandidateSet"]
+__all__ = [
+    "CandidateFinder",
+    "CandidateSet",
+    "group_by_display",
+    "group_by_oaza",
+]
 
 #: 末尾の番地らしき部分。入力が索引鍵の先頭かを試す前にここだけ削る。
 _TRAILING_NUMBER = re.compile(r"[\d\-ー−–—―‐]+$")
@@ -65,8 +71,8 @@ class CandidateSet:
     candidates: list[TownCandidate]
     #: 索引鍵が入力の先頭として一致したか。診断用。
     exact: bool
-    #: 市区町村までは特定できた場合、その city_id
-    city_id: int | None = None
+    #: 市区町村までは特定できた場合、その lg_code
+    city_lg_code: int | None = None
     #: 都道府県までは特定できた場合、その lg_code
     pref_lg_code: int | None = None
     #: 入力がこの粒度で終わっており、それ以上細かく探す余地が無い場合に設定する。
@@ -75,6 +81,14 @@ class CandidateSet:
     #: 候補が Choice の上限を超えており、Jev で分割絞り込み (beam) が要る。
     #: このとき candidates は上限を超えた件数を持つので、そのままでは渡せない。
     needs_beam: bool = False
+
+    def narrowed(self, candidates: list[TownCandidate]) -> CandidateSet:
+        """絞り込んだ候補で置き換える。
+
+        分割絞り込み (beam) の結果を受ける口。絞り終わっているので
+        ``needs_beam`` は下りる。空を渡せば「候補なし」になり、粒度が落ちる。
+        """
+        return replace(self, candidates=candidates, needs_beam=False)
 
     def unambiguous(self) -> TownCandidate | None:
         """選ぶ余地が無い候補があればそれを返す。
@@ -124,18 +138,19 @@ class CandidateFinder:
                 continue
             seen.add(hit.town_id)
             out.append(
+                # 長く一致したものほど上位。同点は索引の順。
                 TownCandidate(
                     town_id=hit.town_id,
                     matched=hit.key,
                     remainder=normalized[hit.matched_len :],
-                    # 長く一致したものほど上位。同点は挿入順。
-                    score=hit.matched_len / len(normalized),
                 )
             )
             if len(out) >= self._cfg.max_candidates:
                 break
         city = self._index.city_prefixes(normalized)
-        return CandidateSet(candidates=out, exact=True, city_id=city[0].city_id if city else None)
+        return CandidateSet(
+            candidates=out, exact=True, city_lg_code=city[0].lg_code if city else None
+        )
 
     # ------------------------------ ② 入力がちょうど市区町村・都道府県で終わる
 
@@ -151,7 +166,7 @@ class CandidateFinder:
             return CandidateSet(
                 candidates=[],
                 exact=True,
-                city_id=city_hits[0].city_id,
+                city_lg_code=city_hits[0].lg_code,
                 exhausted=Level.CITY,
             )
         pref_hit = self._index.pref_prefix(normalized)
@@ -191,23 +206,16 @@ class CandidateFinder:
             seen: set[int] = set()
             out: list[TownCandidate] = []
             remainder = normalized[len(stem) :]
-            for key, town_id in keys:
+            for _key, town_id in keys:
                 if town_id in seen:
                     continue
                 seen.add(town_id)
-                out.append(
-                    TownCandidate(
-                        town_id=town_id,
-                        matched=stem,
-                        remainder=remainder,
-                        score=len(stem) / max(1, len(key)),
-                    )
-                )
+                out.append(TownCandidate(town_id=town_id, matched=stem, remainder=remainder))
                 if len(out) >= self._cfg.max_candidates:
                     break
             city = self._index.city_prefixes(normalized)
             return CandidateSet(
-                candidates=out, exact=False, city_id=city[0].city_id if city else None
+                candidates=out, exact=False, city_lg_code=city[0].lg_code if city else None
             )
         return None
 
@@ -251,13 +259,12 @@ class CandidateFinder:
         remainder = normalized[cut:]
         matched = normalized[:cut]
         candidates = [
-            TownCandidate(town_id=town_id, matched=matched, remainder=remainder, score=0.0)
-            for town_id in seen
+            TownCandidate(town_id=town_id, matched=matched, remainder=remainder) for town_id in seen
         ]
         return CandidateSet(
             candidates=candidates,
             exact=False,
-            city_id=best.city_id,
+            city_lg_code=best.lg_code,
             needs_beam=len(candidates) > limit,
         )
 
@@ -275,7 +282,7 @@ class CandidateFinder:
             best = city_hits[0]
             exhausted = Level.CITY if best.matched_len >= len(normalized) else None
             return CandidateSet(
-                candidates=[], exact=False, city_id=best.city_id, exhausted=exhausted
+                candidates=[], exact=False, city_lg_code=best.lg_code, exhausted=exhausted
             )
 
         pref_hit = self._index.pref_prefix(normalized)
@@ -288,3 +295,40 @@ class CandidateFinder:
                 exhausted=exhausted,
             )
         return CandidateSet(candidates=[], exact=False)
+
+
+# ------------------------------------------------- 候補のまとめ方
+
+
+def group_by_display(
+    candidates: Sequence[TownCandidate], records: dict[int, TownRecord]
+) -> list[list[TownCandidate]]:
+    """表示住所ごとにまとめる。出現順を保つ。
+
+    **表示が同じ候補を判定モデルに重ねて見せない。** 京都市中京区には同名の
+    「大文字町」が 4 つあり、そのまま並べると同一文字列の選択肢が 4 つ並ぶ。
+    答えようがないので確信度が割れ、住所としては正しいのに閾値を下回って
+    粒度が落ちていた。
+    """
+    return _group(candidates, lambda record: record.display, records)
+
+
+def group_by_oaza(
+    candidates: Sequence[TownCandidate], records: dict[int, TownRecord]
+) -> list[list[TownCandidate]]:
+    """大字ごとにまとめる。出現順を保つ。
+
+    候補が上限を超えた市区町村で、先に大字だけを選ばせるときの単位。
+    """
+    return _group(candidates, lambda record: record.oaza_display, records)
+
+
+def _group(
+    candidates: Sequence[TownCandidate],
+    key: Callable[[TownRecord], str],
+    records: dict[int, TownRecord],
+) -> list[list[TownCandidate]]:
+    groups: dict[str, list[TownCandidate]] = {}
+    for candidate in candidates:
+        groups.setdefault(key(records[candidate.town_id]), []).append(candidate)
+    return list(groups.values())

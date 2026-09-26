@@ -3,6 +3,9 @@
 ``Last-Modified`` を横に置いて条件付き GET を投げるので、再実行時に変わって
 いないファイルは 304 で済む。地番まで取ると 1,887 ファイルになるため、
 **再開可能であることが要件**。
+
+HTTP の実装は知らない（:class:`ports.HttpClient` だけを見る）。ここが持つのは
+取得の段取り — 条件付き GET、原子的な差し替え、並行数の制限 — だけ。
 """
 
 from __future__ import annotations
@@ -13,16 +16,13 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
-
+from .. import ports
 from .catalog import FileRef
 
 __all__ = ["Downloader", "Downloaded", "ProgressSink"]
 
 #: (完了数, 総数, 直近のファイル名) を受け取る進捗通知。
 ProgressSink = Callable[[int, int, str], None]
-
-_USER_AGENT = "jev-abr-geocoder/0.1 (+https://github.com/ujiuji1259/jev-abr-geocoder)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,14 +39,14 @@ class Downloader:
     def __init__(
         self,
         cache_dir: Path,
+        client: ports.HttpClient,
         *,
         concurrency: int = 4,
-        client: httpx.AsyncClient | None = None,
         timeout: float = 300.0,
     ) -> None:
         self._cache_dir = cache_dir
-        self._semaphore = asyncio.Semaphore(concurrency)
         self._client = client
+        self._semaphore = asyncio.Semaphore(concurrency)
         self._timeout = timeout
 
     def _target(self, ref: FileRef) -> Path:
@@ -56,7 +56,7 @@ class Downloader:
     def _sidecar(path: Path) -> Path:
         return path.with_suffix(path.suffix + ".meta.json")
 
-    def cached_last_modified(self, ref: FileRef) -> str | None:
+    def _cached_last_modified(self, ref: FileRef) -> str | None:
         """キャッシュ済みファイルの Last-Modified。未取得なら None。"""
         path = self._target(ref)
         sidecar = self._sidecar(path)
@@ -67,23 +67,21 @@ class Downloader:
         except (OSError, ValueError, KeyError):
             return None
 
-    async def download(self, ref: FileRef, client: httpx.AsyncClient) -> Downloaded:
+    async def download(self, ref: FileRef) -> Downloaded:
         path = self._target(ref)
         path.parent.mkdir(parents=True, exist_ok=True)
-        known = self.cached_last_modified(ref)
+        known = self._cached_last_modified(ref)
 
-        headers = {"User-Agent": _USER_AGENT}
-        if known and path.exists():
-            headers["If-Modified-Since"] = known
+        headers = {"If-Modified-Since": known} if known and path.exists() else None
 
         async with self._semaphore:
-            response = await client.get(ref.url, headers=headers, timeout=self._timeout)
+            response = await self._client.get(ref.url, headers=headers, timeout=self._timeout)
 
-        if response.status_code == 304 and path.exists():
+        if response.not_modified and path.exists():
             return Downloaded(ref=ref, path=path, last_modified=known, cached=True)
         response.raise_for_status()
 
-        last_modified = response.headers.get("Last-Modified")
+        last_modified = response.header("Last-Modified")
         # 壊れた途中結果を残さないよう、一時ファイルに書いてから差し替える。
         tmp = path.with_suffix(path.suffix + ".part")
         tmp.write_bytes(response.content)
@@ -96,19 +94,11 @@ class Downloader:
     async def download_all(
         self, refs: Sequence[FileRef], *, progress: ProgressSink | None = None
     ) -> list[Downloaded]:
-        owns_client = self._client is None
-        client = self._client or httpx.AsyncClient(follow_redirects=True)
-        done = 0
         results: list[Downloaded] = []
-        try:
-            tasks = [asyncio.create_task(self.download(ref, client)) for ref in refs]
-            for coro in asyncio.as_completed(tasks):
-                result = await coro
-                done += 1
-                results.append(result)
-                if progress is not None:
-                    progress(done, len(refs), result.ref.filename)
-        finally:
-            if owns_client:
-                await client.aclose()
+        tasks = [asyncio.create_task(self.download(ref)) for ref in refs]
+        for done, coro in enumerate(asyncio.as_completed(tasks), start=1):
+            result = await coro
+            results.append(result)
+            if progress is not None:
+                progress(done, len(refs), result.ref.filename)
         return results
